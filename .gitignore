@@ -1,0 +1,11 @@
+/LiveRec/
+/.build-tools/
+/biliLive-tools/
+/docs/research/
+**/node_modules/
+**/.env
+**/.env.*
+**/client_secret*.json
+**/credentials*.json
+/Script/**/*.txt
+*.log

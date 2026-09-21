@@ -1,0 +1,8 @@
+/target/
+/web/node_modules/
+/web/dist/
+/.local/
+/desktop/resources/
+/desktop/gen/
+/dist/
+*.log

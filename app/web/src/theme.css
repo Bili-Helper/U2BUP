@@ -1,0 +1,120 @@
+/* All UI colors live here; components use semantic tokens in both modes. */
+:root{
+  --app-bg:#f3f4f7;
+  --surface:#ffffff;
+  --surface-soft:#f0f2f6;
+  --surface-raised:#ffffff;
+  --surface-hover:#f5f6fa;
+  --text:#364152;
+  --text-strong:#172132;
+  --text-soft:#5d6879;
+  --border:#dce1e9;
+  --on-accent:#ffffff;
+  --overlay:#101522b3;
+  --drawer-overlay:#10152255;
+  --shadow:#1015221a;
+  --info-bg:#e8f0fc;
+  --info-text:#345d89;
+  --warning-bg:#fff3df;
+  --warning-text:#825814;
+  --warning-border:#ddc18b;
+  --media-bg:#10131b;
+  --media-text:#ffffff;
+  color-scheme:light;
+}
+
+/* Each preset supplies both a workspace accent and a bright sidebar accent. */
+:root,:root[data-accent="forest"]{--accent:#246c51;--accent-hover:#19553f;--accent-soft:#eaf4ef;--sidebar-accent:#85d4ad}
+:root[data-accent="ocean"]{--accent:#246b92;--accent-hover:#174f70;--accent-soft:#e6f2f8;--sidebar-accent:#86cbed}
+:root[data-accent="violet"]{--accent:#7054a3;--accent-hover:#563d83;--accent-soft:#f0eafb;--sidebar-accent:#c3a9f2}
+:root[data-accent="amber"]{--accent:#995719;--accent-hover:#784010;--accent-soft:#fff0df;--sidebar-accent:#efba7e}
+:root[data-accent="rose"]{--accent:#a64d68;--accent-hover:#84364f;--accent-soft:#f9e8ee;--sidebar-accent:#eda5bd}
+
+:root[data-theme="dark"]{
+  --app-bg:#14171e;
+  --surface:#212630;
+  --surface-soft:#282f3b;
+  --surface-raised:#292f3b;
+  --surface-hover:#303744;
+  --text:#dfe5ef;
+  --text-strong:#f6f8fc;
+  --text-soft:#b3bed0;
+  --border:#414c5e;
+  --on-accent:#14171e;
+  --overlay:#080b12cc;
+  --drawer-overlay:#080b1288;
+  --shadow:#00000055;
+  --info-bg:#24384f;
+  --info-text:#a7cef5;
+  --warning-bg:#3d3020;
+  --warning-text:#f0c47e;
+  --warning-border:#78603b;
+  color-scheme:dark;
+}
+:root[data-theme="dark"][data-accent="forest"]{--accent:#85d4ad;--accent-hover:#a4e5c4;--accent-soft:#243f35}
+:root[data-theme="dark"][data-accent="ocean"]{--accent:#86cbed;--accent-hover:#addff7;--accent-soft:#223c4e}
+:root[data-theme="dark"][data-accent="violet"]{--accent:#c3a9f2;--accent-hover:#d8c4fb;--accent-soft:#3a304e}
+:root[data-theme="dark"][data-accent="amber"]{--accent:#efba7e;--accent-hover:#f7d2a5;--accent-soft:#453525}
+:root[data-theme="dark"][data-accent="rose"]{--accent:#eda5bd;--accent-hover:#f6c0d2;--accent-soft:#472d3c}
+
+:root{
+  --line:var(--border);
+  --focus:var(--accent);
+  --accent-border:color-mix(in srgb,var(--accent) 48%,var(--border));
+  --sidebar:color-mix(in srgb,var(--sidebar-accent) 10%,#111620);
+  --sidebar-text:#d1d9e6;
+  --sidebar-strong:#f6f8fc;
+  --sidebar-muted:#a5b2c5;
+  --sidebar-on-accent:#14171e;
+  --sidebar-border:color-mix(in srgb,var(--sidebar-accent) 20%,var(--sidebar));
+  --sidebar-hover:color-mix(in srgb,var(--sidebar-accent) 12%,var(--sidebar));
+  --sidebar-active:color-mix(in srgb,var(--sidebar-accent) 24%,var(--sidebar));
+  --thumbnail-bg:var(--surface-soft);
+  --thumbnail-text:var(--text-soft);
+  --topbar:var(--surface);
+  --toast-bg:var(--surface-raised);
+  --toast-text:var(--text-strong);
+  --toast-border:var(--accent);
+}
+html,body,#app{min-height:100%;background:var(--app-bg);color:var(--text)}
+body{transition:background-color .18s ease,color .18s ease}
+h1,h2,h3{color:var(--text-strong)}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+textarea{background:var(--surface-raised);color:var(--text)}
+input::placeholder,textarea::placeholder{color:var(--text-soft)}
+.primary{color:var(--on-accent)}
+.stat-card{border-top:2px solid var(--accent-border)}
+.stat-card>strong{color:var(--text-strong)}
+.stat-card>span svg{color:var(--accent)}
+nav button.active>svg,.sidebar-bottom>button.active>svg{color:var(--sidebar-accent)}
+.sidebar .dot{background:var(--sidebar-accent)}
+.badge .dot{background:currentColor}
+progress::-moz-progress-bar{background:var(--accent)}
+.theme-toggle{border:1px solid var(--border);background:var(--surface);color:var(--accent)}
+.theme-toggle:hover{background:var(--accent-soft)!important}
+.appearance-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px}
+.appearance-heading h2{margin-bottom:0}
+.appearance-heading p{margin-top:8px}
+.appearance-panel fieldset{border:0;border-top:1px solid var(--border);margin:22px 0 0;padding:20px 0 0}
+.appearance-panel legend{padding:0 12px 0 0;color:var(--text-soft);font-size:11px;font-weight:600}
+.mode-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.mode-option{min-height:76px;border:1px solid var(--border);border-radius:9px;background:var(--surface-soft);padding:14px;text-align:left;justify-content:flex-start;color:var(--text-soft)}
+.mode-option>span{display:flex;flex:1;flex-direction:column;gap:5px}
+.mode-option strong,.accent-option strong,.motion-option strong{color:var(--text);font-size:11px}
+.mode-option small,.motion-option small{color:var(--text-soft);font-size:9px;line-height:1.5}
+.mode-option.selected{border-color:var(--accent);background:var(--accent-soft);color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.theme-result{font-size:10px;margin-top:10px!important;color:var(--text-soft)}
+.accent-grid{display:flex;flex-wrap:wrap;gap:10px}
+.accent-option{min-width:102px;border:1px solid var(--border);border-radius:8px;background:var(--surface-soft);padding:10px 12px;justify-content:flex-start}
+.accent-option>span{width:18px;height:18px;border-radius:50%;box-shadow:inset 0 0 0 1px #ffffff55}
+.accent-option strong{flex:1;text-align:left}
+.accent-option.selected{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent);background:var(--accent-soft)}
+.motion-option{display:flex;align-items:flex-start;gap:11px;border-top:1px solid var(--border);margin-top:22px;padding-top:20px;color:var(--text)}
+.motion-option>span{display:flex;flex-direction:column;gap:5px}
+
+
+:root[data-reduce-motion="true"] *,
+:root[data-reduce-motion="true"] *::before,
+:root[data-reduce-motion="true"] *::after{animation-duration:.001ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.001ms!important}
+
+@media(max-width:600px){.mode-grid{grid-template-columns:1fr}.accent-option{min-width:calc(50% - 5px);flex:1}.appearance-heading{align-items:stretch;flex-direction:column}.appearance-heading .subtle{align-self:flex-start}}

@@ -1,0 +1,14 @@
+[package]
+name = "u2bup-desktop"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+u2bup-core = { path = "../crates/core" }
+tokio = { version = "1", features = ["full"] }

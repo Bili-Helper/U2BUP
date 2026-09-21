@@ -1,0 +1,32 @@
+[package]
+name = "u2bup-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+fs2 = "0.4"
+mime_guess = "2"
+quick-xml = "0.38"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+webbrowser = { version = "1", features = ["hardened"] }
+
+[dev-dependencies]
+tempfile = "3"
