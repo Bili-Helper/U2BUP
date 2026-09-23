@@ -1,0 +1,111 @@
+name: Build foundation
+
+on:
+  push:
+    branches: [main]
+    paths: ['app/**', '.github/workflows/build.yml']
+  pull_request:
+    paths: ['app/**', '.github/workflows/build.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: '1.98.1'
+  NODE_VERSION: '24.21.0'
+
+jobs:
+  desktop:
+    name: Compile and test / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/web/package-lock.json
+      - name: Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --component rustfmt --component clippy
+          rustup override set ${{ env.RUST_VERSION }}
+          rustup target add ${{ matrix.target }}
+      - name: Build embedded WebUI
+        run: |
+          npm --prefix web ci --no-audit --no-fund
+          npm --prefix web run build
+          npm --prefix web test
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check all crates
+        run: cargo check --workspace --all-targets --target ${{ matrix.target }} --locked
+      - name: Test core and server
+        run: cargo test -p u2bup-core -p u2bup-server --target ${{ matrix.target }} --locked
+      - name: Build release executables
+        run: cargo build --release -p u2bup-desktop -p u2bup-server --target ${{ matrix.target }} --locked
+      - name: Check headless service boundary
+        env:
+          U2BUP_TEST_SERVER: ${{ github.workspace }}/app/target/${{ matrix.target }}/release/u2bup-server${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: node scripts/smoke-headless.mjs
+      # These are compiler outputs, not installers or media-complete portable packages.
+      # Production bundling requires a verified FFmpeg source and per-platform runtime QA.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unbundled-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            app/target/${{ matrix.target }}/release/u2bup-desktop
+            app/target/${{ matrix.target }}/release/u2bup-desktop.exe
+            app/target/${{ matrix.target }}/release/u2bup-server
+            app/target/${{ matrix.target }}/release/u2bup-server.exe
+            docs/CROSS-PLATFORM.md
+
+  container:
+    name: Headless container / ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Build native headless image
+        run: docker build --tag u2bup:ci --file app/Dockerfile app
+      - name: Verify authentication, media tools and clean shutdown
+        run: node app/scripts/smoke-container.mjs u2bup:ci

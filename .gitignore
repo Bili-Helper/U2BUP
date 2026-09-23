@@ -1,5 +1,6 @@
 /LiveRec/
 /.build-tools/
+/.playwright-cli/
 /biliLive-tools/
 /docs/research/
 **/node_modules/

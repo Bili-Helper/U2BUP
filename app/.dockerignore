@@ -1,0 +1,22 @@
+# Allowlist: real recordings, local databases and OAuth clients never enter context.
+**
+!Cargo.toml
+!Cargo.lock
+!crates/
+!crates/**
+!desktop/
+!desktop/Cargo.toml
+!desktop/build.rs
+!desktop/src/
+!desktop/src/**
+!web/
+!web/package.json
+!web/package-lock.json
+!web/index.html
+!web/tsconfig*.json
+!web/vite.config.*
+!web/src/
+!web/src/**
+!web/public/
+!web/public/**
+!THIRD-PARTY-NOTICES.md

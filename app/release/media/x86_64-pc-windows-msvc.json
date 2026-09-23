@@ -1,0 +1,23 @@
+{
+  "target": "x86_64-pc-windows-msvc",
+  "status": "ready",
+  "notes": "Gyan FFmpeg 8.0 full build via GitHub release asset (GyanD/codexffmpeg).",
+  "archives": [
+    {
+      "url": "https://github.com/GyanD/codexffmpeg/releases/download/8.0/ffmpeg-8.0-full_build.7z",
+      "sha256": "973db2088fc8dacc927443a95e1ddbfc686170a7e748d0ac810ae5ab81587b30",
+      "format": "7z"
+    }
+  ],
+  "binaries": {
+    "ffmpeg": {
+      "path": "ffmpeg-8.0-full_build/bin/ffmpeg.exe",
+      "sha256": "81b5832f6c548d64feba0ec7d643397e2351d9f3460a65c6c296956045eebaea"
+    },
+    "ffprobe": {
+      "path": "ffmpeg-8.0-full_build/bin/ffprobe.exe",
+      "sha256": "421dbc81a3d758dfe114534ff48ef47a61ef91896eb4b9e819609a8752ab8272"
+    }
+  },
+  "licenses": ["LICENSE"]
+}

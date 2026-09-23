@@ -1,0 +1,46 @@
+services:
+  u2bup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: u2bup:headless-preview
+    init: true
+    ports:
+      - '127.0.0.1:${U2BUP_PORT:-4173}:4173'
+    command:
+      - --headless
+      - --bind
+      - 0.0.0.0
+      - --public-origin
+      - 'http://127.0.0.1:${U2BUP_PORT:-4173}'
+      - --library
+      - /media/library
+      - --data
+      - /data
+      - --output
+      - /output
+      - --ffmpeg
+      - /usr/bin/ffmpeg
+      - --ffprobe
+      - /usr/bin/ffprobe
+    volumes:
+      - type: bind
+        source: '${U2BUP_LIBRARY:?Set U2BUP_LIBRARY to an existing media folder}'
+        target: /media/library
+        read_only: true
+        bind:
+          create_host_path: false
+      - u2bup-data:/data
+      - u2bup-output:/output
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 75s
+
+volumes:
+  u2bup-data:
+  u2bup-output:

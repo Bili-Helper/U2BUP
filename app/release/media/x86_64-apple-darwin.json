@@ -1,0 +1,29 @@
+{
+  "target": "x86_64-apple-darwin",
+  "status": "ready",
+  "notes": "evermeet.cx FFmpeg/FFprobe 9.0.2 (Intel). GPL license copied from release/media/licenses.",
+  "archives": [
+    {
+      "url": "https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip",
+      "sha256": "4acc0be580f9b2788029eb7bd4d645ff87968911b0a62aeeb3940d42d54558d5",
+      "format": "zip"
+    },
+    {
+      "url": "https://evermeet.cx/ffmpeg/ffprobe-9.0.2.zip",
+      "sha256": "24a9c968cd4da72d99c7245e914b921815835eb6dff01d99868031aebaf1d439",
+      "format": "zip"
+    }
+  ],
+  "binaries": {
+    "ffmpeg": {
+      "path": "ffmpeg",
+      "sha256": "a45b462cf91ed89148ae218c4577e30896485d7a6792c3673bcf5f823fa01b63"
+    },
+    "ffprobe": {
+      "path": "ffprobe",
+      "sha256": "a29f8c2e03553223a8b480b1a1f04c42f680c138fa952c20086718a075db38cb"
+    }
+  },
+  "licenses": ["GPLv3.txt"],
+  "licenseBundle": ["GPLv3.txt"]
+}

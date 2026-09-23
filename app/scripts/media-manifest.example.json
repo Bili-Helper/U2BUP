@@ -1,0 +1,8 @@
+{
+  "target": "x86_64-pc-windows-msvc",
+  "sha256": {
+    "ffmpeg": "REPLACE_WITH_REVIEWED_FFMPEG_BINARY_SHA256",
+    "ffprobe": "REPLACE_WITH_REVIEWED_FFPROBE_BINARY_SHA256"
+  },
+  "licenses": ["LICENSE"]
+}

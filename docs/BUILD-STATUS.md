@@ -1,3 +1,70 @@
+# v0.7：Tag 触发的预览 / 正式 Release CI
+
+日期：2026-09-22。版本号统一为 `0.7.0`。新增 [`.github/workflows/release.yml`](../.github/workflows/release.yml)：仅在推送 `v*` tag 时打包并写入 GitHub Release，日常 push/PR 仍只跑 [build.yml](../.github/workflows/build.yml) 编译检查。
+
+- **预览 (A)**：`vX.Y.Z-preview.N` / `vX.Y.Z-rc.N` → Pre-release；各平台 unbundled zip（desktop + server，**不含 FFmpeg**）。
+- **正式 (B)**：`vX.Y.Z` → 正式 Release；Windows 便携包含经 pin 校验的 FFmpeg；macOS **DMG**（暂未公证）；Linux **AppImage** + `.deb`。
+- 媒体 pin：[`app/release/media/`](../app/release/media/)；下载校验与入库：`app/scripts/fetch-release-media.mjs`；制品组装：`app/scripts/package-release.mjs`。
+- 文档：根 README「GitHub Releases」小节、[CROSS-PLATFORM](CROSS-PLATFORM.md) 中 A/B 边界说明。
+
+验证：本机已跑通 Windows pin 拉取与 `package-release` 预览/正式 zip；全平台正式包以本 tag 触发的 GitHub Actions 产物为准。macOS 签名/公证与 Windows Authenticode 仍未接入。
+
+---
+
+# v0.6：管线模块插件化与开发者接口
+
+日期：2026-09-22。版本号统一为 `0.6.0`。仓库根目录增加开源风格 [README](../README.md)；模块协议与 YouTube API 对照见 [WORKFLOW-MODULE-API](WORKFLOW-MODULE-API.md)。
+
+- 内置节点以 `com.u2bup.builtin.*` 注册并保留短别名；画布模块库由注册表驱动。新增 **来源身份台账** 节点与 SQLite 台账 API。
+- 支持声明式 **L1** 模块包安装/启用/卸载（`u2bup-module.json`）；预览仍为零远端副作用，写 YouTube 仅宿主 Intent。
+- 文档：Intent Schema、模块 API 手册；示例标签词典包。前端模块测试与既有 workflow 回归一并保留。
+
+验证：前端测试（含 modules）与 Rust `u2bup-core` 库测试在发版前通过；Windows 便携包目标目录 `app/dist/U2BUP-0.6.0-windows-x64/`（`U2BUP.exe` + `u2bup-server.exe`）。第三方 L2 沙箱与公网插件市场仍未开放。
+
+---
+
+# v0.5：已上传视频与素材库的可组合处理管线
+
+日期：2026-09-22。版本号已统一更新为 `0.5.0`，Windows Desktop 便携包已构建于 `app/dist/U2BUP-0.5.0-windows-x64/`，入口为 `U2BUP.exe`；同包提供独立 Web 服务及 FFmpeg/FFprobe。构建脚本现在从 Cargo workspace 版本生成包名，避免下次发版遗漏目录版本。
+
+- 根据 `app/.local/channel-research/` 的真实频道只读快照，增加 13 种可拼接节点与 4 套模板。Canvas 支持拖动、连线、条件分流和汇合、节点配置、保存、导入导出、撤销重做；本地素材与已上传视频可进入同一套预览流程。
+- 已实现来源与场次候选、平台及内容多标签、标题与描述规范化、播放列表意图、封面当前帧、质量例外和版权人工标记。低置信度身份、房间归属和重复候选进入复核，AI 内容理解保留结构化接口，不伪装成已生成结果。
+- 已接通本地结构化资料、YouTube 元信息及播放列表修改、关联 MP4 取帧并上传封面。远端应用前核对频道、旧值和 ETag，逐项记录结果；上传准备可继承已确认的素材资料。真实频道本轮只读，未实际提交远端批改。
+
+验证：前端 23 项、Rust workspace 30 项测试通过；Vue 类型检查及 Vite 生产构建通过；`cargo build --release -p u2bup-desktop -p u2bup-server --locked` 通过。隔离启动便携包内的 `u2bup-server.exe`，认证快照返回 `0.5.0`，确认包内 FFmpeg/FFprobe 路径有效。Desktop 可执行文件已经生成；本轮未在真实桌面会话中重新执行 GUI 操作验收。管线行为、真实快照试跑与范围限制见 [管线设计与实现状态](CHANNEL-WORKFLOW-DESIGN.md)。
+
+---
+
+# v0.4：导航、选择与统一任务中心
+
+日期：2026-09-21（用户本地时间）。已构建 Windows 桌面和 Web 服务 v0.4.0；本机 4173 服务升级后保留 163 个素材、历史任务与现有 YouTube 授权。
+
+- 六组可展开导航、18 个子页面、hash 深链接与前进/后退。YouTube 视频、上传、变更记录和账号配置独立显示；切换页面保留上传草稿。
+- 素材/频道视频支持全局清空、本页选择、反选、Shift 连选，明确展示筛选外的选中数。频道视频每页 30 项。
+- `/api/tasks` 合并媒体与上传记录，任务中心提供类型/状态/文字筛选和受当前状态约束的操作。上传沿用原续传会话；任务列表无需读取 YouTube 凭据。
+- 频道同步过滤重复 ID、检测分页 token 循环；成功后保存唯一数量、原始数量、重复数与完成时间。轮询账号状态使用轻量接口。
+- 增加原生跨平台 CI、媒体组件校验脚本、macOS/Linux 打包配置、实验性 Docker headless。状态与剩余工作见 [跨平台构建](CROSS-PLATFORM.md)。
+
+验证：21 项 Rust 测试、4 项选择/路由测试、workspace Clippy、TypeScript/Vite 生产构建与 Windows release 构建通过。隔离合成素材的 21 项 FFmpeg 端到端检查通过，包括取消/重试、成品复用、超长转码切割、中文路径和源文件 SHA-256 保持不变；记录位于 `app/.local/smoke/2026-09-22T02-02-39-772Z/report.json`。
+
+浏览器验证覆盖：媒体库筛选后全局取消、1,034 条频道记录的 30 项分页、跨页/跨筛选选择、上传草稿返回后保留、任务中心与原计划入口、独立变更页、深色主题以及 840px 窄屏导航。实际检查发现并修复了本页选择数量的显示问题。真实频道操作限于只读同步，没有上传或应用远端变更。
+
+另通过 8 项本机 headless 启动/鉴权/禁用 YouTube 边界检查（`app/.local/headless-smoke/2026-09-22T02-09-53-255Z/report.json`），以及 Node 媒体准备脚本对本机 FFmpeg/FFprobe 的复制与版本验证。headless 本机检查不等于 Docker 镜像已运行。
+
+首轮频道调查得到 1,034 个唯一视频（原始 1,887 条记录包含重复 ID）。新版只读复测返回 1,021 个可读取视频、1,893 条原始记录和 869 条重复记录，说明两轮列表存在波动，不能视为 Studio 全量对账已通过；复测统计在 `app/.local/v04-channel-sync-verification.json`。具体开发建议见 [调研结论](CHANNEL-MANAGEMENT-FINDINGS.md)。原始标题和私密视频信息保存在 `.local/channel-research/`，不纳入 Git。
+
+macOS/Linux/Docker 尚未实际构建验收，容器 OAuth 暂不支持；批量元信息变更尚未纳入任务中心。当前提供跨平台构建基础，不宣称全平台发行完成。
+
+---
+
+# v0.3.1 状态补充：2026-09-21（历史记录）
+
+当前应用版本为 v0.3.1，主题修复证据见 [主题验证](THEME-VERIFICATION.md)。用户在本次沟通中确认：已实际测试真实 YouTube 私密上传，结果可以接受。将该项更新为「用户实测通过」，不扩大为远端批量修改、播放列表或所有网络恢复场景均已验收；本轮没有再次操作账号。
+
+后续开发顺序、八项扩展需求及验收门槛见 [下一阶段开发规划](DEVELOPMENT-ROADMAP.md)。下方 v0.1–v0.3 为各阶段当时的历史记录，不代表新增规划已经完成。
+
+---
+
 # v0.3：界面主题
 
 日期：2026-09-21。新增浅色、深色、跟随系统模式，森林、海洋、紫罗兰、琥珀、玫瑰五种主题色，减少动态效果选项，以及顶栏明暗快捷切换。设置保存在当前 WebView/浏览器的 `localStorage`，不进入业务数据库；系统模式会监听操作系统主题变化。已验证深色紫罗兰主题、顶栏切换、刷新后保留偏好及恢复默认，并通过 TypeScript/Vite 生产构建。
@@ -21,7 +88,7 @@ v0.3 便携入口：`app/dist/U2BUP-0.3.0-windows-x64/U2BUP.exe`。已在仅保�
 
 模拟 YouTube 服务测试覆盖：部分接收后返回 503、配额错误中断后恢复、按服务器 Range 续传、最后一块响应丢失后的完成确认、不重复建立上传会话、输入变更拦截、远端字段冲突拦截、保留未编辑字段、成功项目不重复提交、错误 OAuth state 拒绝。模拟端点只编译进 Rust 测试，发行程序固定连接 Google 服务。
 
-**尚未用真实 OAuth 客户端完成 Google 授权、实际上传或远端批量修改验收。** 本机没有配置用户凭据，未上传任何 LiveRec 视频至 YouTube。下一步在应用中导入自己的桌面 OAuth JSON 并授权，以私密测试视频完成实号验证。
+v0.2 开发时尚未用真实 OAuth 客户端完成 Google 授权、实际上传或远端批量修改验收，当时未配置用户凭据，也未上传 LiveRec 视频。后续状态已更新：2026-09-21 用户反馈真实私密上传测试通过；远端批量管理另行验收。
 
 Windows v0.2 便携程序已在仅 Windows/System32 的搜索路径下启动验证，读取 163 个素材并使用包内 FFmpeg/FFprobe；YouTube 配置状态接口正常。本地记录：`app/.local/v02-portable-verification.json`。
 

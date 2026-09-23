@@ -5,6 +5,7 @@ pub mod model;
 pub mod planner;
 pub mod scanner;
 mod web;
+mod workflow;
 mod youtube;
 
 use anyhow::{bail, Context, Result};
@@ -23,6 +24,9 @@ pub struct Config {
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
     pub port: u16,
+    pub bind: std::net::IpAddr,
+    pub public_origin: Option<String>,
+    pub headless: bool,
 }
 impl Config {
     pub fn from_args(args: impl Iterator<Item = String>) -> Result<Self> {
@@ -34,9 +38,16 @@ impl Config {
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
             port: 4173,
+            bind: std::net::Ipv4Addr::LOCALHOST.into(),
+            public_origin: None,
+            headless: false,
         };
         let mut args = args;
         while let Some(key) = args.next() {
+            if key == "--headless" {
+                c.headless = true;
+                continue;
+            }
             let value = args.next().context("参数缺少值")?;
             match key.as_str() {
                 "--library" => c.library = value.into(),
@@ -45,10 +56,39 @@ impl Config {
                 "--ffmpeg" => c.ffmpeg = value.into(),
                 "--ffprobe" => c.ffprobe = value.into(),
                 "--port" => c.port = value.parse()?,
+                "--bind" => c.bind = value.parse().context("--bind 必须是 IPv4 或 IPv6 地址")?,
+                "--public-origin" => c.public_origin = Some(value),
                 _ => bail!("未知参数：{key}"),
             }
         }
+        c.validate_network()?;
         Ok(c)
+    }
+
+    fn validate_network(&mut self) -> Result<()> {
+        if !self.bind.is_loopback() && (!self.headless || self.public_origin.is_none()) {
+            bail!("监听非回环地址需要 --headless 和明确的 --public-origin");
+        }
+        if let Some(value) = &self.public_origin {
+            if !self.headless {
+                bail!("--public-origin 仅用于 --headless 模式；桌面 OAuth 需要本机回环地址");
+            }
+            let url = reqwest::Url::parse(value).context("--public-origin 不是有效 URL")?;
+            if !["http", "https"].contains(&url.scheme())
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.path() != "/"
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || url.port() == Some(0)
+                || matches!(url.host_str(), Some("0.0.0.0" | "[::]"))
+            {
+                bail!("--public-origin 必须是浏览器访问的 http(s)://主机[:端口]，不能包含路径、凭据、参数或通配地址");
+            }
+            self.public_origin = Some(url.origin().ascii_serialization());
+        }
+        Ok(())
     }
 }
 pub(crate) struct AppState {
@@ -61,6 +101,7 @@ pub(crate) struct AppState {
     thumbnails: Semaphore,
     token: String,
     authority: String,
+    origin: String,
     shutdown: CancellationToken,
     _lock: std::fs::File,
     youtube: youtube::Runtime,
@@ -71,6 +112,7 @@ pub struct Running {
     pub task: tokio::task::JoinHandle<Result<()>>,
 }
 pub async fn start(mut config: Config) -> Result<Running> {
+    config.validate_network()?;
     config.library = config
         .library
         .canonicalize()
@@ -93,6 +135,7 @@ pub async fn start(mut config: Config) -> Result<Running> {
     let db = Db::open(&config.data.join("u2bup.sqlite3"))?;
     let library = db.get::<Library>("library", "main")?.unwrap_or_default();
     youtube::recover(&db)?;
+    workflow::recover(&db)?;
     if !library.root.is_empty() && std::path::Path::new(&library.root) != config.library {
         bail!("当前数据目录属于另一个素材库，请使用独立 --data 目录");
     }
@@ -104,15 +147,22 @@ pub async fn start(mut config: Config) -> Result<Running> {
             db.put("job", &job.id, &job)?;
         }
     }
-    let listener =
-        tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, config.port)).await?;
-    let authority = listener.local_addr()?.to_string();
+    let listener = tokio::net::TcpListener::bind((config.bind, config.port)).await?;
+    let origin = config
+        .public_origin
+        .clone()
+        .unwrap_or_else(|| format!("http://{}", listener.local_addr().expect("bound listener")));
+    let authority = origin
+        .split_once("://")
+        .expect("validated origin")
+        .1
+        .to_owned();
     let token = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
-    let launch_url = format!("http://{authority}/#token={token}");
+    let launch_url = format!("{origin}/#token={token}");
     let shutdown = CancellationToken::new();
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -124,6 +174,7 @@ pub async fn start(mut config: Config) -> Result<Running> {
         thumbnails: Semaphore::new(2),
         token,
         authority,
+        origin,
         shutdown: shutdown.clone(),
         _lock: lock,
         youtube: youtube::Runtime::default(),
@@ -154,6 +205,56 @@ pub async fn start(mut config: Config) -> Result<Running> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_arguments_require_explicit_headless_origin() {
+        let parse = |args: &[&str]| Config::from_args(args.iter().map(|value| value.to_string()));
+        let defaults = parse(&[]).unwrap();
+        assert!(defaults.bind.is_loopback());
+        assert!(!defaults.headless);
+        assert!(parse(&["--bind", "0.0.0.0"]).is_err());
+        assert!(parse(&["--headless", "--bind", "0.0.0.0"]).is_err());
+        assert!(parse(&["--public-origin", "http://localhost:4173"]).is_err());
+        let config = parse(&[
+            "--headless",
+            "--bind",
+            "0.0.0.0",
+            "--public-origin",
+            "https://u2bup.example:8443/",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.public_origin.as_deref(),
+            Some("https://u2bup.example:8443")
+        );
+        let ipv6 = parse(&["--headless", "--public-origin", "http://[::1]:8080"]).unwrap();
+        assert_eq!(ipv6.public_origin.as_deref(), Some("http://[::1]:8080"));
+    }
+
+    #[test]
+    fn public_origin_rejects_ambiguous_or_credential_bearing_urls() {
+        for origin in [
+            "ftp://localhost",
+            "http://user:secret@localhost",
+            "http://localhost/app",
+            "http://localhost/?token=value",
+            "http://localhost/#token=value",
+            "http://0.0.0.0:4173",
+            "http://[::]:4173",
+            "http://localhost:0",
+            "not a url",
+        ] {
+            assert!(
+                Config::from_args(
+                    ["--headless", "--public-origin", origin]
+                        .map(String::from)
+                        .into_iter()
+                )
+                .is_err(),
+                "must reject {origin}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn startup_recovers_jobs_and_isolates_sessions() {
@@ -205,6 +306,9 @@ mod tests {
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
             port: 0,
+            bind: std::net::Ipv4Addr::LOCALHOST.into(),
+            public_origin: None,
+            headless: false,
         };
         let first = start(config.clone()).await.unwrap();
         let url = reqwest::Url::parse(&first.launch_url).unwrap();
@@ -246,6 +350,9 @@ mod tests {
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
             port: 0,
+            bind: std::net::Ipv4Addr::LOCALHOST.into(),
+            public_origin: None,
+            headless: false,
         })
         .await
         .unwrap();

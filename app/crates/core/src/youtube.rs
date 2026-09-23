@@ -20,10 +20,12 @@ const API: &str = "https://www.googleapis.com/youtube/v3";
 const TOKEN: &str = "https://oauth2.googleapis.com/token";
 const UPLOAD: &str = "https://www.googleapis.com/upload/youtube/v3/videos";
 const CHUNK: usize = 8 * 1024 * 1024;
+pub(crate) const HEADLESS_REASON: &str =
+    "当前 headless 服务仅支持本地媒体处理；YouTube 账号连接和上传请使用桌面版或本机服务";
 type HttpResult<T> = std::result::Result<Json<T>, ApiError>;
 #[derive(Default)]
 pub(crate) struct Runtime {
-    operation: Arc<Mutex<()>>,
+    pub(crate) operation: Arc<Mutex<()>>,
     credentials: Mutex<()>,
     pending: Mutex<Option<Pending>>,
     queue: Mutex<()>,
@@ -153,7 +155,7 @@ async fn access(s: &AppState) -> Result<String> {
     }
     Ok(c.access_token)
 }
-async fn api_get(s: &AppState, path: &str, query: &[(&str, &str)]) -> Result<Value> {
+pub(crate) async fn api_get(s: &AppState, path: &str, query: &[(&str, &str)]) -> Result<Value> {
     checked(
         client()?
             .get(format!("{}/{path}", endpoint(s, API)))
@@ -165,9 +167,98 @@ async fn api_get(s: &AppState, path: &str, query: &[(&str, &str)]) -> Result<Val
     )
     .await
 }
+// Workflow endpoints share the same credential store, channel fence and operation lock.
+pub(crate) fn workflow_channel(s: &AppState) -> Result<String> {
+    if s.config.headless {
+        bail!("{HEADLESS_REASON}");
+    }
+    let c = credentials(s)?;
+    if c.channel_id.is_empty() || c.access_token.is_empty() {
+        bail!("请先连接 YouTube 频道");
+    }
+    Ok(c.channel_id)
+}
+#[derive(Debug)]
+struct WorkflowResponseError {
+    definitive: bool,
+    message: String,
+}
+impl std::fmt::Display for WorkflowResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+impl std::error::Error for WorkflowResponseError {}
+async fn workflow_response(response: reqwest::Response) -> Result<Value> {
+    let status = response.status();
+    checked(response).await.map_err(|e| {
+        WorkflowResponseError {
+            definitive: status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT,
+            message: format!("{e:#}"),
+        }
+        .into()
+    })
+}
+pub(crate) fn workflow_definitive_failure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<WorkflowResponseError>()
+        .is_some_and(|e| e.definitive)
+}
+pub(crate) async fn workflow_write(
+    s: &AppState,
+    method: reqwest::Method,
+    path: &str,
+    part: &str,
+    body: &Value,
+    etag: Option<&str>,
+) -> Result<Value> {
+    workflow_channel(s)?;
+    if !["videos", "playlists", "playlistItems"].contains(&path) {
+        bail!("不支持的管线写入目标");
+    }
+    let mut request = client()?
+        .request(method, format!("{}/{path}", endpoint(s, API)))
+        .query(&[("part", part)])
+        .bearer_auth(access(s).await?)
+        .json(body);
+    if let Some(etag) = etag {
+        request = request.header("If-Match", etag);
+    }
+    workflow_response(
+        request
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("更新响应未知；重试时必须先核对远端状态"))?,
+    )
+    .await
+}
+pub(crate) async fn workflow_thumbnail(
+    s: &AppState,
+    video_id: &str,
+    bytes: Vec<u8>,
+) -> Result<Value> {
+    workflow_channel(s)?;
+    let url = format!(
+        "{}/thumbnails/set",
+        endpoint(s, UPLOAD).trim_end_matches("/videos")
+    );
+    workflow_response(
+        client()?
+            .post(url)
+            .query(&[("videoId", video_id), ("uploadType", "media")])
+            .bearer_auth(access(s).await?)
+            .header("Content-Type", "image/jpeg")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("封面上传响应未知，请在 Studio 核对后重新预览"))?,
+    )
+    .await
+}
 pub(crate) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/youtube", get(snapshot))
+        .route("/api/youtube/status", get(status))
         .route("/api/youtube/config", post(configure))
         .route("/api/youtube/connect", post(connect))
         .route("/oauth/youtube/callback", get(callback))
@@ -180,6 +271,14 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/youtube/batches/{id}/apply", post(apply))
 }
 async fn snapshot(State(s): State<Arc<AppState>>) -> HttpResult<Value> {
+    if s.config.headless {
+        return Ok(Json(json!({
+            "enabled": false, "reason": HEADLESS_REASON,
+            "configured": false, "connected": false, "channel": null,
+            "videos": [], "uploads": upload_summaries(&s.db)?,
+            "artifacts": s.db.list::<Artifact>("artifact")?, "batches": []
+        })));
+    }
     let c = credentials(&s)?;
     let ids =
         s.db.get::<Vec<Value>>("yt-video-list", &c.channel_id)?
@@ -203,10 +302,58 @@ async fn snapshot(State(s): State<Arc<AppState>>) -> HttpResult<Value> {
                 v
             })
             .collect::<Vec<_>>();
-    let uploads=s.db.list::<UploadJob>("yt-upload")?.into_iter().map(|j|json!({"id":j.id,"title":j.metadata.title,"artifact_id":j.artifact_id,"status":j.status,"bytes":j.bytes,"offset":j.offset,"message":j.message,"video_id":j.video_id,"privacy":j.metadata.privacy,"channel_id":j.channel_id})).collect::<Vec<_>>();
+    let uploads = upload_summaries(&s.db)?;
     Ok(Json(
-        json!({"configured":!c.client_id.is_empty(),"connected":!c.access_token.is_empty(),"channel":s.db.get::<Value>("yt-channel","main")?,"videos":videos,"uploads":uploads,"artifacts":s.db.list::<Artifact>("artifact")?,"batches":s.db.list::<Batch>("yt-batch")?}),
+        json!({"enabled":true,"configured":!c.client_id.is_empty(),"connected":!c.access_token.is_empty(),"channel":s.db.get::<Value>("yt-channel","main")?,"last_sync":s.db.get::<Value>("yt-sync",&c.channel_id)?,"videos":videos,"uploads":uploads,"artifacts":s.db.list::<Artifact>("artifact")?,"batches":s.db.list::<Batch>("yt-batch")?}),
     ))
+}
+// This polling endpoint only reads local state and never refreshes OAuth tokens.
+async fn status(State(s): State<Arc<AppState>>) -> HttpResult<Value> {
+    let uploads = upload_summaries(&s.db)?;
+    if s.config.headless {
+        return Ok(Json(json!({
+            "enabled": false, "reason": HEADLESS_REASON,
+            "configured": false, "connected": false, "channel": null,
+            "uploads": uploads, "credential_error": null
+        })));
+    }
+    let (configured, connected, channel, credential_error) = match credentials(&s) {
+        Ok(c) => (
+            !c.client_id.is_empty(),
+            !c.access_token.is_empty(),
+            s.db.get::<Value>("yt-channel", "main")?,
+            None,
+        ),
+        Err(_) => (
+            false,
+            false,
+            None,
+            Some("无法读取账号凭据，请检查系统凭据存储；本地任务仍可使用"),
+        ),
+    };
+    Ok(Json(json!({
+        "enabled": true, "configured": configured, "connected": connected, "channel": channel,
+        "uploads": uploads, "credential_error": credential_error
+    })))
+}
+
+pub(crate) fn upload_summaries(db: &Db) -> Result<Vec<Value>> {
+    Ok(db
+        .list::<UploadJob>("yt-upload")?
+        .into_iter()
+        .map(|j| {
+            json!({
+                "id": j.id, "title": j.metadata.title, "artifact_id": j.artifact_id,
+                "status": j.status, "bytes": j.bytes, "offset": j.offset,
+                "message": j.message, "video_id": j.video_id, "privacy": j.metadata.privacy,
+                "channel_id": j.channel_id, "created_at": j.created_at, "updated_at": j.updated_at
+            })
+        })
+        .collect())
+}
+
+pub(crate) fn upload_token_key(id: &str) -> String {
+    format!("upload:{id}")
 }
 async fn configure(State(s): State<Arc<AppState>>, Json(v): Json<Value>) -> HttpResult<Value> {
     let _op = s
@@ -373,7 +520,18 @@ async fn sync(State(s): State<Arc<AppState>>) -> HttpResult<Value> {
         .context("缺少上传列表")?;
     let mut token = String::new();
     let mut found = Vec::new();
+    let mut page_tokens = std::collections::HashSet::new();
+    let mut requested_ids = std::collections::HashSet::new();
+    let mut found_ids = std::collections::HashSet::new();
+    let mut records = 0usize;
+    let mut duplicates = 0usize;
     loop {
+        if !page_tokens.insert(token.clone()) {
+            return Err(anyhow::anyhow!(
+                "YouTube 返回重复分页标记，已停止同步并保留上次完整视频列表；请稍后重试"
+            )
+            .into());
+        }
         let v = api_get(
             &s,
             "playlistItems",
@@ -390,6 +548,15 @@ async fn sync(State(s): State<Arc<AppState>>) -> HttpResult<Value> {
             .context("无效视频列表")?
             .iter()
             .filter_map(|i| i["contentDetails"]["videoId"].as_str())
+            .filter(|id| {
+                records += 1;
+                if requested_ids.insert((*id).to_owned()) {
+                    true
+                } else {
+                    duplicates += 1;
+                    false
+                }
+            })
             .collect::<Vec<_>>()
             .join(",");
         if !ids.is_empty() {
@@ -403,7 +570,10 @@ async fn sync(State(s): State<Arc<AppState>>) -> HttpResult<Value> {
             )
             .await?;
             for video in videos["items"].as_array().context("无效视频响应")? {
-                found.push(video.clone());
+                let id = video["id"].as_str().context("视频 ID 缺失")?;
+                if found_ids.insert(id.to_owned()) {
+                    found.push(video.clone());
+                }
             }
         }
         token = v["nextPageToken"].as_str().unwrap_or("").into();
@@ -416,7 +586,10 @@ async fn sync(State(s): State<Arc<AppState>>) -> HttpResult<Value> {
     for v in &found {
         s.db.put("yt-video", v["id"].as_str().context("视频 ID 缺失")?, v)?;
     }
-    Ok(Json(json!({"count":found.len()})))
+    let summary =
+        json!({"count":found.len(),"records":records,"duplicates":duplicates,"completed_at":now()});
+    s.db.put("yt-sync", &credentials(&s)?.channel_id, &summary)?;
+    Ok(Json(summary))
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Metadata {
@@ -475,18 +648,28 @@ struct UploadJob {
     session: Option<String>,
     video_id: Option<String>,
     message: String,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+fn save_upload(db: &Db, job: &mut UploadJob) -> Result<()> {
+    job.updated_at = Some(now());
+    db.put("yt-upload", &job.id, job)
 }
 #[derive(Deserialize)]
 struct Enqueue {
     artifact_ids: Vec<String>,
     metadata: Metadata,
+    #[serde(default)]
+    use_workflow_metadata: bool,
 }
 pub(crate) fn recover(db: &Db) -> Result<()> {
     for mut j in db.list::<UploadJob>("yt-upload")? {
         if ["running", "queued"].contains(&j.status.as_str()) {
             j.status = "interrupted".into();
             j.message = "服务中断，点击继续以查询远端进度".into();
-            db.put("yt-upload", &j.id, &j)?;
+            save_upload(db, &mut j)?;
         }
     }
     Ok(())
@@ -524,6 +707,29 @@ async fn enqueue(State(s): State<Arc<AppState>>, Json(r): Json<Enqueue>) -> Http
             return Err(anyhow::anyhow!("成品已变化或超过 YouTube 上传限制").into());
         }
         let mut metadata = r.metadata.clone();
+        if r.use_workflow_metadata {
+            let prepared = crate::workflow::prepared_upload(&s.db, &a.source_ids)?
+                .context("成品没有可继承的素材元信息")?;
+            let library = s.library.read().await;
+            for source_id in &a.source_ids {
+                let source = library
+                    .assets
+                    .iter()
+                    .find(|asset| asset.id == *source_id)
+                    .context("成品来源素材已不存在，请重新检查上传元信息")?;
+                if source.display_title.as_ref().unwrap_or(&source.title) != &prepared.title {
+                    return Err(anyhow::anyhow!(
+                        "素材标题在管线处理后变化，请重新应用管线元信息再上传"
+                    )
+                    .into());
+                }
+            }
+            metadata.title = prepared.title;
+            metadata.description = prepared.description;
+            metadata.tags = prepared.tags;
+            metadata.category_id = prepared.category_id;
+            metadata.privacy = prepared.privacy;
+        }
         metadata.title = metadata.title.replace(
             "{文件名}",
             path.file_stem()
@@ -545,6 +751,8 @@ async fn enqueue(State(s): State<Arc<AppState>>, Json(r): Json<Enqueue>) -> Http
             session: None,
             video_id: None,
             message: "等待上传".into(),
+            created_at: Some(now()),
+            updated_at: Some(now()),
         });
     }
     for j in &jobs {
@@ -558,7 +766,7 @@ async fn schedule(s: Arc<AppState>, mut j: UploadJob) {
     s.cancellations
         .lock()
         .await
-        .insert(j.id.clone(), cancel.clone());
+        .insert(upload_token_key(&j.id), cancel.clone());
     tokio::spawn(async move {
         let permit = tokio::select! {p=s.youtube.operation.lock()=>Some(p),_=cancel.cancelled()=>None,_=s.shutdown.cancelled()=>None};
         let result = if permit.is_some() {
@@ -577,23 +785,32 @@ async fn schedule(s: Arc<AppState>, mut j: UploadJob) {
             .into();
             j.message = format!("{e:#}");
         }
-        let _ = s.db.put("yt-upload", &j.id, &j);
-        s.cancellations.lock().await.remove(&j.id);
+        let _ = save_upload(&s.db, &mut j);
+        s.cancellations
+            .lock()
+            .await
+            .remove(&upload_token_key(&j.id));
     });
 }
-async fn pause(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> HttpResult<Value> {
+pub(crate) async fn pause(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> HttpResult<Value> {
     s.cancellations
         .lock()
         .await
-        .get(&id)
+        .get(&upload_token_key(&id))
         .context("上传未在运行")?
         .cancel();
     Ok(Json(json!({"ok":true})))
 }
-async fn resume(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> HttpResult<Value> {
+pub(crate) async fn resume(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> HttpResult<Value> {
     let _queue = s.youtube.queue.lock().await;
     let mut tokens = s.cancellations.lock().await;
-    if tokens.contains_key(&id) {
+    if tokens.contains_key(&upload_token_key(&id)) {
         return Err(anyhow::anyhow!("任务已在队列中").into());
     }
     let mut j =
@@ -603,8 +820,9 @@ async fn resume(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> HttpR
         return Err(anyhow::anyhow!("视频已上传").into());
     }
     j.status = "queued".into();
-    s.db.put("yt-upload", &id, &j)?;
-    tokens.insert(id, CancellationToken::new());
+    j.message = "等待继续上传".into();
+    save_upload(&s.db, &mut j)?;
+    tokens.insert(upload_token_key(&id), CancellationToken::new());
     drop(tokens);
     schedule(s.clone(), j).await;
     Ok(Json(json!({"ok":true})))
@@ -658,7 +876,7 @@ async fn upload(s: &AppState, j: &mut UploadJob) -> Result<()> {
     }
     j.status = "running".into();
     j.message = "连接 YouTube 断点上传服务".into();
-    s.db.put("yt-upload", &j.id, j)?;
+    save_upload(&s.db, j)?;
     if j.session.is_none() {
         let r=client()?.post(endpoint(s, UPLOAD)).query(&[("uploadType","resumable"),("part","snippet,status"),("notifySubscribers","false")]).bearer_auth(access(s).await?).header("X-Upload-Content-Length",j.bytes).header("X-Upload-Content-Type","video/mp4").json(&json!({"snippet":{"title":j.metadata.title,"description":j.metadata.description,"tags":j.metadata.tags,"categoryId":j.metadata.category_id},"status":{"privacyStatus":j.metadata.privacy,"selfDeclaredMadeForKids":j.metadata.made_for_kids}})).send().await.map_err(|_|anyhow::anyhow!("创建上传会话网络失败，尚未发送媒体数据"))?;
         if !r.status().is_success() {
@@ -673,7 +891,7 @@ async fn upload(s: &AppState, j: &mut UploadJob) -> Result<()> {
             .to_owned();
         validate_session(s, &url)?;
         j.session = Some(url);
-        s.db.put("yt-upload", &j.id, j)?;
+        save_upload(&s.db, j)?;
     }
     let url = j.session.clone().unwrap();
     validate_session(s, &url)?;
@@ -726,7 +944,7 @@ async fn upload(s: &AppState, j: &mut UploadJob) -> Result<()> {
                 }
                 j.offset = next;
                 j.message = format!("已上传 {:.1}%", 100.0 * j.offset as f64 / j.bytes as f64);
-                s.db.put("yt-upload", &j.id, j)?;
+                save_upload(&s.db, j)?;
             }
             Ok(r) if r.status().is_success() => {
                 let v = checked(r).await?;
@@ -739,7 +957,7 @@ async fn upload(s: &AppState, j: &mut UploadJob) -> Result<()> {
                 j.offset = j.bytes;
                 j.status = "completed".into();
                 j.message = "上传完成，YouTube 仍可能在处理视频".into();
-                s.db.put("yt-upload", &j.id, j)?;
+                save_upload(&s.db, j)?;
                 return Ok(());
             }
             Ok(r) if r.status().is_server_error() || r.status().as_u16() == 429 => {
@@ -805,7 +1023,7 @@ struct Edit {
     privacy: Option<String>,
     group: Option<String>,
 }
-fn writable(v: &Value, part: &str) -> Value {
+pub(crate) fn writable(v: &Value, part: &str) -> Value {
     let fields = if part == "snippet" {
         vec![
             "title",
@@ -1037,7 +1255,7 @@ mod tests {
     }
 }
 #[cfg(test)]
-mod protocol_tests {
+pub(crate) mod protocol_tests {
     use super::*;
     use axum::{
         body::Bytes,
@@ -1101,7 +1319,7 @@ mod protocol_tests {
         }
         response
     }
-    fn state(root: &std::path::Path, base: String) -> AppState {
+    pub(crate) fn state(root: &std::path::Path, base: String) -> AppState {
         AppState {
             config: crate::Config {
                 library: root.into(),
@@ -1110,6 +1328,9 @@ mod protocol_tests {
                 ffmpeg: "ffmpeg".into(),
                 ffprobe: "ffprobe".into(),
                 port: 0,
+                bind: std::net::Ipv4Addr::LOCALHOST.into(),
+                public_origin: None,
+                headless: false,
             },
             db: Db::open(&root.join("test.sqlite")).unwrap(),
             library: tokio::sync::RwLock::new(Library::default()),
@@ -1119,6 +1340,7 @@ mod protocol_tests {
             thumbnails: tokio::sync::Semaphore::new(1),
             token: "local".into(),
             authority: "127.0.0.1:0".into(),
+            origin: "http://127.0.0.1:0".into(),
             shutdown: CancellationToken::new(),
             _lock: std::fs::File::create(root.join("lock")).unwrap(),
             youtube: Runtime {
@@ -1180,6 +1402,8 @@ mod protocol_tests {
             session: None,
             video_id: None,
             message: String::new(),
+            created_at: Some(now()),
+            updated_at: Some(now()),
         };
         assert!(upload(&s, &mut j)
             .await
@@ -1209,6 +1433,104 @@ mod protocol_tests {
             .contains("变化"));
         server.abort();
     }
+    #[tokio::test]
+    async fn channel_sync_deduplicates_pages_and_preserves_the_previous_list_on_token_cycles() {
+        struct Pages {
+            repeat: std::sync::atomic::AtomicBool,
+            requested: Mutex<Vec<String>>,
+        }
+        async fn channel() -> Json<Value> {
+            Json(
+                json!({"items":[{"id":"channel","contentDetails":{"relatedPlaylists":{"uploads":"uploads"}}}]}),
+            )
+        }
+        async fn playlist(
+            State(p): State<Arc<Pages>>,
+            Query(q): Query<std::collections::HashMap<String, String>>,
+        ) -> Json<Value> {
+            let page = q.get("pageToken").map(String::as_str).unwrap_or("");
+            if page.is_empty() {
+                Json(
+                    json!({"items":[{"contentDetails":{"videoId":"v1"}},{"contentDetails":{"videoId":"v1"}},{"contentDetails":{"videoId":"v2"}}],"nextPageToken":"next"}),
+                )
+            } else {
+                let mut result = json!({"items":[{"contentDetails":{"videoId":"v2"}},{"contentDetails":{"videoId":"v3"}}]});
+                if p.repeat.load(Ordering::SeqCst) {
+                    result["nextPageToken"] = json!("next");
+                }
+                Json(result)
+            }
+        }
+        async fn videos(
+            State(p): State<Arc<Pages>>,
+            Query(q): Query<std::collections::HashMap<String, String>>,
+        ) -> Json<Value> {
+            p.requested.lock().await.push(q["id"].clone());
+            let mut items = q["id"]
+                .split(',')
+                .map(|id| json!({"id":id,"snippet":{"channelId":"channel","title":id}}))
+                .collect::<Vec<_>>();
+            items.push(items[0].clone());
+            Json(json!({"items":items}))
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let pages = Arc::new(Pages {
+            repeat: std::sync::atomic::AtomicBool::new(false),
+            requested: Mutex::new(vec![]),
+        });
+        let router = Router::new()
+            .route("/api/channels", get(channel))
+            .route("/api/playlistItems", get(playlist))
+            .route("/api/videos", get(videos))
+            .with_state(pages.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let s = Arc::new(state(temp.path(), base));
+        s.db.put("yt-group", "v1", &json!("本地分组")).unwrap();
+        let result = sync(State(s.clone())).await.ok().unwrap().0;
+        assert_eq!(result["count"], 3);
+        assert_eq!(result["records"], 5);
+        assert_eq!(result["duplicates"], 2);
+        assert!(result["completed_at"].as_str().is_some());
+        assert_eq!(
+            s.db.get::<Value>("yt-sync", "channel").unwrap().unwrap(),
+            result
+        );
+        assert_eq!(*pages.requested.lock().await, vec!["v1,v2", "v3"]);
+        let saved =
+            s.db.get::<Vec<Value>>("yt-video-list", "channel")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            saved
+                .iter()
+                .map(|v| v["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["v1", "v2", "v3"]
+        );
+        assert_eq!(s.db.list::<Value>("yt-video").unwrap().len(), 3);
+        assert_eq!(
+            s.db.get::<Value>("yt-group", "v1").unwrap().unwrap(),
+            "本地分组"
+        );
+        pages.repeat.store(true, Ordering::SeqCst);
+        let baseline = vec![json!({"id":"previous-complete-list"})];
+        s.db.put("yt-video-list", "channel", &baseline).unwrap();
+        let error = match sync(State(s.clone())).await {
+            Ok(_) => panic!("cyclic pagination must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            s.db.get::<Vec<Value>>("yt-video-list", "channel")
+                .unwrap()
+                .unwrap(),
+            baseline
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn invalid_oauth_state_does_not_consume_pending_authorization() {
         let temp = tempfile::tempdir().unwrap();

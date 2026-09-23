@@ -1,0 +1,254 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: '1.98.1'
+  NODE_VERSION: '24.21.0'
+
+jobs:
+  classify:
+    name: Classify tag
+    runs-on: ubuntu-24.04
+    outputs:
+      channel: ${{ steps.meta.outputs.channel }}
+      tag: ${{ steps.meta.outputs.tag }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - id: meta
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(preview|rc)\.[0-9]+$ ]]; then
+            echo "channel=preview" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Unsupported release tag: $TAG (expected vX.Y.Z, vX.Y.Z-preview.N, or vX.Y.Z-rc.N)"
+            exit 1
+          fi
+
+  preview:
+    name: Preview A / ${{ matrix.target }}
+    needs: classify
+    if: needs.classify.outputs.channel == 'preview'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/web/package-lock.json
+      - name: Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Install Rust
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+          rustup override set ${{ env.RUST_VERSION }}
+          rustup target add ${{ matrix.target }}
+      - name: Build WebUI
+        run: |
+          npm --prefix web ci --no-audit --no-fund
+          npm --prefix web run build
+          npm --prefix web test
+      - name: Build release binaries
+        run: cargo build --release -p u2bup-desktop -p u2bup-server --target ${{ matrix.target }} --locked
+      - name: Headless smoke
+        env:
+          U2BUP_TEST_SERVER: ${{ github.workspace }}/app/target/${{ matrix.target }}/release/u2bup-server${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: node scripts/smoke-headless.mjs
+      - name: Package unbundled zip
+        run: >
+          node scripts/package-release.mjs
+          --mode preview
+          --tag ${{ needs.classify.outputs.tag }}
+          --target ${{ matrix.target }}
+          --bin-dir target/${{ matrix.target }}/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            app/dist/release/${{ needs.classify.outputs.tag }}/*.zip
+            app/dist/release/${{ needs.classify.outputs.tag }}/*.sha256
+
+  stable:
+    name: Stable B / ${{ matrix.target }}
+    needs: classify
+    if: needs.classify.outputs.channel == 'stable'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            kind: windows
+          - os: macos-15
+            target: aarch64-apple-darwin
+            kind: macos
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            kind: macos
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            kind: linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/web/package-lock.json
+      - name: Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2
+      - name: Install 7-Zip (Windows media extract)
+        if: runner.os == 'Windows'
+        run: choco install 7zip.install -y
+      - name: Install xz-utils (Linux media extract)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y xz-utils
+      - name: Install Rust
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+          rustup override set ${{ env.RUST_VERSION }}
+          rustup target add ${{ matrix.target }}
+      - name: Build WebUI
+        run: |
+          npm --prefix web ci --no-audit --no-fund
+          npm --prefix web run build
+          npm --prefix web test
+      - name: Fetch and stage pinned FFmpeg
+        run: node scripts/fetch-release-media.mjs --target ${{ matrix.target }}
+      - name: Build release binaries
+        run: cargo build --release -p u2bup-desktop -p u2bup-server --target ${{ matrix.target }} --locked
+      - name: Headless smoke
+        env:
+          U2BUP_TEST_SERVER: ${{ github.workspace }}/app/target/${{ matrix.target }}/release/u2bup-server${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: node scripts/smoke-headless.mjs
+      - name: Package Windows portable
+        if: matrix.kind == 'windows'
+        run: >
+          node scripts/package-release.mjs
+          --mode stable-windows
+          --tag ${{ needs.classify.outputs.tag }}
+          --bin-dir target/${{ matrix.target }}/release
+      - name: Tauri macOS DMG
+        if: matrix.kind == 'macos'
+        working-directory: app/desktop
+        run: |
+          ../web/node_modules/.bin/tauri build --config tauri.bundle.macos.json --target ${{ matrix.target }} --ci
+      - name: Tauri Linux AppImage/deb
+        if: matrix.kind == 'linux'
+        working-directory: app/desktop
+        run: |
+          ../web/node_modules/.bin/tauri build --config tauri.bundle.linux.json --target ${{ matrix.target }} --ci
+      - name: Collect macOS/Linux bundles
+        if: matrix.kind != 'windows'
+        run: >
+          node scripts/package-release.mjs
+          --mode stable-bundle
+          --tag ${{ needs.classify.outputs.tag }}
+          --os ${{ matrix.kind }}
+          --target ${{ matrix.target }}
+          --bundle-dir target/${{ matrix.target }}/release/bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stable-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            app/dist/release/${{ needs.classify.outputs.tag }}/*.zip
+            app/dist/release/${{ needs.classify.outputs.tag }}/*.sha256
+            app/dist/release/${{ needs.classify.outputs.tag }}/*.dmg
+            app/dist/release/${{ needs.classify.outputs.tag }}/*.AppImage
+            app/dist/release/${{ needs.classify.outputs.tag }}/*.deb
+
+  publish:
+    name: Publish GitHub Release
+    needs: [classify, preview, stable]
+    if: always() && needs.classify.result == 'success' && (needs.preview.result == 'success' || needs.stable.result == 'success') && (needs.preview.result != 'failure' && needs.stable.result != 'failure')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: ${{ needs.classify.outputs.channel }}-*
+          merge-multiple: true
+      - name: List assets
+        run: find release-assets -type f | sort
+      - name: Compose release notes banner
+        id: notes
+        shell: bash
+        run: |
+          TAG='${{ needs.classify.outputs.tag }}'
+          CHANNEL='${{ needs.classify.outputs.channel }}'
+          {
+            if [ "$CHANNEL" = preview ]; then
+              echo "## Preview (package A)"
+              echo
+              echo "Unbundled multi-platform zips — **FFmpeg is not included**. Prefer stable tags for installers."
+            else
+              echo "## Stable (package B)"
+              echo
+              echo "Windows portable zip includes reviewed FFmpeg. macOS ships **unsigned** DMG (Gatekeeper may block until notarization). Linux ships AppImage and deb."
+            fi
+            echo
+            echo "Tag: \`$TAG\`"
+            echo
+          } > release-banner.md
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.classify.outputs.tag }}
+          name: U2BUP ${{ needs.classify.outputs.tag }}
+          prerelease: ${{ needs.classify.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          body_path: release-banner.md
+          files: |
+            release-assets/**
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

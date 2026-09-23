@@ -1,0 +1,29 @@
+{
+  "target": "aarch64-apple-darwin",
+  "status": "ready",
+  "notes": "osxexperts.net FFmpeg 8.0 ARM builds. GPL license copied from release/media/licenses. Re-pin if upstream replaces the zip in place.",
+  "archives": [
+    {
+      "url": "https://www.osxexperts.net/ffmpeg80arm.zip",
+      "sha256": "0d4efcaf6a098430a708e0af694a84792938921fa126162787ae98c6151d7a95",
+      "format": "zip"
+    },
+    {
+      "url": "https://www.osxexperts.net/ffprobe80arm.zip",
+      "sha256": "b46eb342707ec0d31d3e8337bb56831e59c9e20918f414fd7a9d65a32fcb348f",
+      "format": "zip"
+    }
+  ],
+  "binaries": {
+    "ffmpeg": {
+      "path": "ffmpeg",
+      "sha256": "77d2c853f431318d55ec02676d9b2f185ebfdddb9f7677a251fbe453affe025a"
+    },
+    "ffprobe": {
+      "path": "ffprobe",
+      "sha256": "babf170e86bd6b0b2fefee5fa56f57721b0acb98ad2794b095d8030b02857dfe"
+    }
+  },
+  "licenses": ["GPLv3.txt"],
+  "licenseBundle": ["GPLv3.txt"]
+}
