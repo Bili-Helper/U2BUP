@@ -11,6 +11,7 @@
   <a href="https://github.com/Bili-Helper/U2BUP/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/Bili-Helper/U2BUP" /></a>
   <a href="LICENSE"><img alt="License: GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-blue.svg" /></a>
   <a href="https://github.com/Bili-Helper/U2BUP/releases"><img alt="Version" src="https://img.shields.io/badge/version-v0.7.0-brightgreen.svg" /></a>
+  <a href="https://github.com/Bili-Helper/U2BUP/releases"><img alt="Preview" src="https://img.shields.io/badge/preview-v0.8.0--preview.1-orange.svg" /></a>
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20x64-0078D4.svg" />
 </p>
 
@@ -55,6 +56,16 @@ First milestone targets existing **LiveRec** libraries. Real-time multi-platform
 | **Module plugins (moduleApi 1)** | Builtin nodes as `com.u2bup.builtin.*`; installable **declarative L1** JSON packs; enable/disable; host-owned YouTube intents only |
 | **Themes** | Light / dark / system + accent themes |
 
+### Preview in **v0.8.0-preview.1** (multi-library, Phase 1 in progress)
+
+| Area | State |
+| --- | --- |
+| **Multi-library backend** | SQLite schema v2 (`libraries`, `assets_v2`), library CRUD, `folder` scanner with glob excludes and incremental rescan, paginated `/api/assets`, publish-metadata update API |
+| **Welcome & library switching** | First-run welcome screen, `/library/manage` page, add-library dialog (LiveRec / folder / WebDAV / OpenList), sidebar per-library switching |
+| **Not yet** | Publish-metadata editor, cross-library flat list, migrating legacy LiveRec assets into `assets_v2`, `--library` auto-creating a LiveRec library |
+
+Design: [`docs/MEDIA-LIBRARY-EXPANSION.md`](docs/MEDIA-LIBRARY-EXPANSION.md).
+
 ### Explicitly **not** finished
 
 - Full biliLive-tools live recording inside the package  
@@ -70,7 +81,7 @@ First milestone targets existing **LiveRec** libraries. Real-time multi-platform
 ### Windows portable build (recommended locally)
 
 ```text
-app/dist/U2BUP-0.7.0-windows-x64/
+app/dist/U2BUP-<version>-windows-x64/
   U2BUP.exe          # desktop
   u2bup-server.exe   # headless / browser UI
   Start-Web.ps1
@@ -129,7 +140,7 @@ Aligned with [`docs/DEVELOPMENT-ROADMAP.md`](docs/DEVELOPMENT-ROADMAP.md) and [`
 
 | Horizon | Direction |
 | --- | --- |
-| **Near** | Stronger identity ledger UX; L1 module sharing; safer remote batch apply on real channels; upload→playlist/thumbnail chaining |
+| **Near** | Finish v0.8 multi-library Phase 1 (publish-metadata editor, cross-library list, legacy LiveRec migration); stronger identity ledger UX; L1 module sharing; safer remote batch apply on real channels; upload→playlist/thumbnail chaining |
 | **Next** | biliLive-tools adapter for live recording; multi-root libraries; captions/chapters; session/version archive model |
 | **Later** | Trusted L2 preview sandbox; optional AI providers; cross-platform signed installs; NAS/Docker headless with proper OAuth |
 

@@ -307,3 +307,15 @@ main{margin-left:68px;width:calc(100% - 68px)}
 .modal{padding:22px}
 .two-fields{grid-template-columns:1fr;gap:0}
 }
+
+
+/* ── Multi-library sidebar styles ─────────────────────────────────────── */
+.sidebar-heading{display:flex;align-items:center;justify-content:space-between}
+.sidebar-add-lib{width:20px;height:20px;border-radius:4px;padding:0;color:var(--sidebar-muted);margin-right:3px}
+.sidebar-add-lib:hover{background:var(--sidebar-hover);color:var(--sidebar-text)}
+.library-root-active{background:var(--sidebar-active)!important;color:var(--sidebar-strong)!important}
+.library-root-add{color:var(--sidebar-muted);font-size:11px;gap:8px;margin:4px 10px 0;padding:8px 14px}
+.library-root-add:hover{color:var(--sidebar-text);background:var(--sidebar-hover)}
+.lib-scanning-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--accent);animation:pulse-lib 1s infinite;margin-left:auto;flex-shrink:0}
+.lib-error-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:#ef4444;margin-left:auto;flex-shrink:0}
+@keyframes pulse-lib{0%,100%{opacity:1}50%{opacity:.3}}

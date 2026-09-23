@@ -4427,13 +4427,14 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "u2bup-core"
-version = "0.7.0"
+version = "0.8.0-preview.1"
 dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
  "chrono",
  "fs2",
+ "glob",
  "keyring",
  "mime_guess",
  "quick-xml 0.38.4",
@@ -4456,7 +4457,7 @@ dependencies = [
 
 [[package]]
 name = "u2bup-desktop"
-version = "0.7.0"
+version = "0.8.0-preview.1"
 dependencies = [
  "tauri",
  "tauri-build",
@@ -4467,7 +4468,7 @@ dependencies = [
 
 [[package]]
 name = "u2bup-server"
-version = "0.7.0"
+version = "0.8.0-preview.1"
 dependencies = [
  "anyhow",
  "tokio",

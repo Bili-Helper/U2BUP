@@ -11,13 +11,15 @@ if ($LASTEXITCODE -ne 0) { throw 'WebUI build failed' }
 & (Join-Path $PSScriptRoot 'stage-media.ps1') -FfmpegDir $FfmpegDir
 & $cargoPath build --release -p u2bup-desktop -p u2bup-server --locked
 if ($LASTEXITCODE -ne 0) { throw 'Rust build failed' }
-$versionMatch = Select-String -LiteralPath (Join-Path $applicationRoot 'Cargo.toml') -Pattern '^version = "(\d+\.\d+\.\d+)"$' | Select-Object -First 1
+$versionMatch = Select-String -LiteralPath (Join-Path $applicationRoot 'Cargo.toml') -Pattern '^version = "(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)"$' | Select-Object -First 1
 if (-not $versionMatch) { throw 'Workspace version not found in Cargo.toml' }
 $version = $versionMatch.Matches[0].Groups[1].Value
+$targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $applicationRoot 'target' }
+$releaseDir = Join-Path $targetDir 'release'
 $destination = Join-Path $applicationRoot "dist\U2BUP-$version-windows-x64"
 New-Item -ItemType Directory -Path $destination -Force | Out-Null
-Copy-Item -LiteralPath 'target\release\u2bup-desktop.exe' -Destination (Join-Path $destination 'U2BUP.exe') -Force
-Copy-Item -LiteralPath 'target\release\u2bup-server.exe' -Destination (Join-Path $destination 'u2bup-server.exe') -Force
+Copy-Item -LiteralPath (Join-Path $releaseDir 'u2bup-desktop.exe') -Destination (Join-Path $destination 'U2BUP.exe') -Force
+Copy-Item -LiteralPath (Join-Path $releaseDir 'u2bup-server.exe') -Destination (Join-Path $destination 'u2bup-server.exe') -Force
 $mediaDestination = Join-Path $destination 'resources'
 New-Item -ItemType Directory -Path $mediaDestination -Force | Out-Null
 Get-ChildItem -LiteralPath 'desktop\resources' -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $mediaDestination $_.Name) -Force }

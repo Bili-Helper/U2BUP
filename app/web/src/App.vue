@@ -6,10 +6,11 @@ import WorkflowStudio from './WorkflowStudio.vue';
 import AppearanceSettings from './AppearanceSettings.vue';
 import TaskCenter from './TaskCenter.vue';
 import SelectionToolbar from './SelectionToolbar.vue';
+import LibraryManager from './LibraryManager.vue';
 import {routes,resolveRoute,type AppRoute} from './navigation';
 import {selectIds,toggleId,selectionCounts} from './selection';
 import {useTheme} from './theme';
-import type {Asset,Job,Plan,Room,Snapshot,UnifiedTask,TaskAction,TaskSnapshot} from './types';
+import type {Asset,Job,Plan,Room,Snapshot,UnifiedTask,TaskAction,TaskSnapshot,LibraryRoot,LibraryKind} from './types';
 
 const route=ref<AppRoute>(resolveRoute(location.hash));
 const expanded=ref<Record<string,boolean>>({[route.value.group]:true}),mobileMenu=ref(false);
@@ -68,8 +69,47 @@ function date(s:string|null){if(!s)return '时间待确认';return new Intl.Date
 function notify(s:string){toast.value=s;if(toastTimer)clearTimeout(toastTimer);toastTimer=setTimeout(()=>toast.value='',9000);}
 async function api<T=any>(path:string,body?:unknown):Promise<T>{const r=await fetch(`/api${path}`,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});const value=await r.json();if(r.status===401)locked.value=true;if(!r.ok)throw new Error(value.error??`请求失败 ${r.status}`);return value;}
 async function perform(f:()=>Promise<void>){busy.value=true;try{await f();}catch(e){notify(String((e as Error).message));}finally{busy.value=false;}}
-async function load(){data.value=await api<Snapshot>('/snapshot');if(!chosenPlan.value&&data.value.plans.length)chosenPlan.value=data.value.plans[0];await refreshTasks();}
+async function load(){data.value=await api<Snapshot>('/snapshot');if(!chosenPlan.value&&data.value.plans.length)chosenPlan.value=data.value.plans[0];await refreshTasks();await loadLibraries();}
 async function connect(token:string){const r=await fetch('/api/session',{method:'POST',headers:{Authorization:`Bearer ${token}`}});if(!r.ok)throw new Error('启动令牌无效，请重新打开本次启动提供的链接');locked.value=false;history.replaceState(null,'',location.pathname+location.search+'#'+route.value.path);await load();}
+
+// ── Multi-library state ─────────────────────────────────────────────────────
+const libraries=ref<LibraryRoot[]>([]);
+const activeLibraryId=ref<string|null>(null);
+const activeLibrary=computed(()=>libraries.value.find(l=>l.id===activeLibraryId.value)??libraries.value[0]??null);
+const showWelcome=computed(()=>!locked.value&&data.value!=null&&libraries.value.length===0&&route.value.group==='library'&&route.value.mode!=='manage');
+
+async function loadLibraries(){
+  try{const res=await api<{libraries:LibraryRoot[]}>('/libraries');libraries.value=res.libraries;if(!activeLibraryId.value&&libraries.value.length)activeLibraryId.value=libraries.value[0].id;}
+  catch{/* server may not have libraries endpoint if in pure legacy mode */}
+}
+async function addLibrary(payload:{name:string;kind:LibraryKind;path:string}){
+  perform(async()=>{
+    const res=await api<{library:LibraryRoot}>('/libraries',payload);
+    libraries.value=[...libraries.value,res.library];
+    activeLibraryId.value=res.library.id;
+    if(res.library.kind!=='liverec'){await api(`/libraries/${res.library.id}/scan`,{});}
+    await loadLibraries();
+    navigate('/library/all');
+    notify(res.library.name+'已添加，扫描已启动。');
+  });
+}
+async function scanLibrary(id:string){
+  const lib=libraries.value.find(l=>l.id===id);
+  if(!lib)return;
+  if(lib.kind==='liverec'){startScan();return;}
+  perform(async()=>{await api(`/libraries/${id}/scan`,{});await loadLibraries();notify('扫描已启动…');});
+}
+async function deleteLibrary(id:string){
+  const lib=libraries.value.find(l=>l.id===id);
+  if(!lib||!confirm(`确定删除素材库「${lib.name}」？已索引的元数据也会删除，源文件不受影响。`))return;
+  perform(async()=>{
+    await api(`/libraries/${id}?deleteAssets=true`,undefined);
+    libraries.value=libraries.value.filter(l=>l.id!==id);
+    if(activeLibraryId.value===id)activeLibraryId.value=libraries.value[0]?.id??null;
+    notify('素材库已删除。');
+  });
+}
+function switchLibrary(id:string){activeLibraryId.value=id;navigate('/library/all');}
 let polling=false;
 async function poll(){if(polling||locked.value||!data.value)return;polling=true;await refreshTasks();try{const p=await api<{scan:Snapshot['scan'];jobs:Job[]}>('/status');const wasScanning=data.value.scan.running;data.value.scan=p.scan;data.value.jobs=p.jobs;if(wasScanning&&!p.scan.running){await load();notify(p.scan.message);}}catch{/* Keep the current view during transient restarts. */}finally{polling=false;}}
 function toggle(id:string,event?:Event){selected.value=toggleId(selected.value,id,filtered.value.map(a=>a.id),selectionAnchor,(event as MouseEvent|undefined)?.shiftKey??false);selectionAnchor=id;}
@@ -102,10 +142,34 @@ onUnmounted(()=>{window.removeEventListener('hashchange',syncRoute);window.remov
         <div v-show="expanded[group.id]" :id="'nav-'+group.id" class="nav-children"><a v-for="child in group.children" :key="child.path" :href="'#'+child.path" :class="{active:route.path===child.path}" :aria-current="route.path===child.path?'page':undefined" @click.prevent="navigate(child.path)">{{child.label}}</a></div>
       </div></nav>
       <div class="sidebar-divider"></div>
-      <div class="sidebar-heading">当前媒体库</div>
-      <button class="library-root" @click="navigate('/settings/environment')"><FolderOpen :size="17"/><span>LiveRec<small>{{assets.length}} 个录像文件</small></span><span class="dot"></span></button>
+      <div class="sidebar-heading">素材库 <button class="sidebar-add-lib" title="添加素材库" @click="navigate('/library/manage')"><Plus :size="12"/></button></div>
+      <!-- Multi-library list -->
+      <template v-if="libraries.length">
+        <button v-for="lib in libraries" :key="lib.id"
+          class="library-root"
+          :class="{'library-root-active': activeLibraryId===lib.id}"
+          @click="switchLibrary(lib.id)">
+          <FolderOpen :size="17"/>
+          <span>{{lib.name}}<small>{{lib.assetCount}} 个文件 · {{lib.kind}}</small></span>
+          <span v-if="lib.scanStatus==='scanning'" class="lib-scanning-dot"></span>
+          <span v-else-if="lib.scanStatus==='error'" class="lib-error-dot"></span>
+          <span v-else class="dot"></span>
+        </button>
+      </template>
+      <!-- Legacy single library (shown when no multi-library entries yet) -->
+      <template v-else>
+        <button class="library-root" @click="navigate('/settings/environment')">
+          <FolderOpen :size="17"/>
+          <span>LiveRec<small>{{assets.length}} 个录像文件</small></span>
+          <span class="dot"></span>
+        </button>
+      </template>
+      <button class="library-root library-root-add" @click="navigate('/library/manage')">
+        <Plus :size="15"/>
+        <span>添加素材库…</span>
+      </button>
 
-      <div class="sidebar-bottom"><div class="version"><span class="dot"></span>U2BUP <span>v0.7.0</span></div></div>
+      <div class="sidebar-bottom"><div class="version"><span class="dot"></span>U2BUP <span>v0.8.0-preview.1</span></div></div>
     </aside>
     <main>
       <header class="topbar"><button class="icon-button mobile-menu-button" aria-label="展开或收起导航" :aria-expanded="mobileMenu" @click="mobileMenu=!mobileMenu"><ListChecks :size="19"/></button><div class="breadcrumb">{{nav.find(n=>n.id===view)?.label}} <ChevronRight :size="13"/><strong>{{route.label}}</strong></div><div class="top-actions"><span class="local-chip"><Monitor :size="14"/> {{data?.settings.mode??'工作台'}}</span><button class="icon-button theme-toggle" :title="resolvedTheme==='dark'?'切换到浅色模式':'切换到深色模式'" :aria-label="resolvedTheme==='dark'?'切换到浅色模式':'切换到深色模式'" @click="toggleDark"><Sun v-if="resolvedTheme==='dark'" :size="17"/><Moon v-else :size="17"/></button><button class="icon-button" title="刷新视图" aria-label="刷新视图" @click="perform(load)"><RefreshCw :size="17" :class="{spin:busy}"/></button><div class="avatar">U</div></div></header>
@@ -113,6 +177,26 @@ onUnmounted(()=>{window.removeEventListener('hashchange',syncRoute);window.remov
       <div v-else-if="data" class="content">
         <div v-if="scanRunning" class="scan-banner"><LoaderCircle :size="18" class="spin"/><span>{{data.scan.message}} · {{data.scan.completed}} / {{data.scan.total}}</span><progress :max="Math.max(data.scan.total,1)" :value="data.scan.completed"></progress></div>
         <template v-if="view==='library'">
+          <!-- Welcome screen: no libraries exist yet -->
+          <LibraryManager v-if="showWelcome"
+            :libraries="libraries"
+            :busy="busy"
+            @add="addLibrary"
+            @scan="scanLibrary"
+            @delete="deleteLibrary"
+            @navigate="navigate"
+          />
+          <!-- Library management page -->
+          <LibraryManager v-else-if="route.mode==='manage'"
+            :libraries="libraries"
+            :busy="busy"
+            @add="addLibrary"
+            @scan="scanLibrary"
+            @delete="deleteLibrary"
+            @navigate="navigate"
+          />
+          <!-- Normal library views (all / source / legacy / review / folders / unpublished) -->
+          <template v-else>
           <div class="page-heading"><div><div class="eyebrow">YOUR RECORDING LIBRARY</div><h1>每一场直播，都有迹可循<span class="heading-dot">.</span></h1><p>整理历史录播，连接直播间，从素材到成品一目了然。</p></div><button class="primary" :disabled="busy||scanRunning||activeJobs.length>0" @click="startScan"><RefreshCw :size="16" :class="{spin:scanRunning}"/>{{data.library.scanned_at?'重新扫描素材':'扫描 LiveRec'}}</button></div>
           <div class="stats-grid"><div class="stat-card"><span>录像文件<Archive :size="18"/></span><strong>{{assets.length}}<small>个</small></strong><footer>{{assets.filter(a=>a.role==='source').length}} 个原始片段 · {{assets.filter(a=>a.role==='legacy').length}} 个历史成品</footer></div><div class="stat-card"><span>关联直播间<Radio :size="18"/></span><strong>{{rooms.length}}<small>个</small></strong><footer>以房间号关联历史名称与目录</footer></div><div class="stat-card"><span>已知录像时长<Clock3 :size="18"/></span><strong>{{knownHours.toFixed(1)}}<small>小时</small></strong><footer>{{assets.filter(a=>!a.metadata?.duration).length}} 个文件时长待确认 · 未去重</footer></div><div class="stat-card"><span>素材总容量<HardDrive :size="18"/></span><strong>{{(totalBytes/1073741824).toFixed(1)}}<small>GiB</small></strong><footer>原片只读导入，成品单独保存</footer></div></div>
           <div class="section-header"><h2>录像素材 <span class="count">{{assets.length}}</span></h2><div class="caption"><span class="dot"></span>{{data.library.scanned_at?'最近扫描 '+date(data.library.scanned_at):'等待首次导入'}}</div></div>
@@ -127,6 +211,7 @@ onUnmounted(()=>{window.removeEventListener('hashchange',syncRoute);window.remov
           </section>
           <div class="bottom-hint"><ShieldCheck :size="15"/>批量标题仅改变库内显示名称。合并先生成计划，执行结果写入独立目录。</div>
           <SelectionToolbar v-bind="selection" scope="媒体库" @clear="clearSelection"><button class="subtle" @click="openWorkflow('local',[...selected])"><Workflow :size="16"/>加入自定义管线</button><button class="subtle" @click="showTitles"><WandSparkles :size="16"/>编辑显示标题</button><button class="primary" @click="showPlan=true"><Workflow :size="16"/>生成合并计划<ArrowRight :size="16"/></button></SelectionToolbar>
+          </template><!-- end v-else (normal library views) -->
         </template>
 
         <template v-else-if="view==='rooms'">

@@ -1,5 +1,6 @@
 mod db;
 mod jobs;
+pub mod library;
 pub mod media;
 pub mod model;
 pub mod planner;
@@ -113,15 +114,24 @@ pub struct Running {
 }
 pub async fn start(mut config: Config) -> Result<Running> {
     config.validate_network()?;
-    config.library = config
-        .library
-        .canonicalize()
-        .context("素材根目录不存在；请使用 --library 指定")?;
+    // Library path is now optional (multi-library model). When provided, it is
+    // canonicalized and used as the default liverec library root for the legacy
+    // single-library API.  When absent (headless / fresh install), the server
+    // starts with an empty library and waits for the user to add roots via
+    // /api/libraries.
+    if config.library != std::path::PathBuf::from("../LiveRec") || config.library.exists() {
+        config.library = config
+            .library
+            .canonicalize()
+            .context("素材根目录不存在；请使用 --library 指定或通过界面添加素材库")?;
+    }
     std::fs::create_dir_all(&config.data)?;
     config.data = config.data.canonicalize()?;
     std::fs::create_dir_all(&config.output)?;
     config.output = config.output.canonicalize()?;
-    if config.output.starts_with(&config.library) || config.data.starts_with(&config.library) {
+    if config.library.exists()
+        && (config.output.starts_with(&config.library) || config.data.starts_with(&config.library))
+    {
         bail!("应用数据和输出目录必须在原始素材库之外");
     }
     let lock = std::fs::OpenOptions::new()
@@ -136,7 +146,13 @@ pub async fn start(mut config: Config) -> Result<Running> {
     let library = db.get::<Library>("library", "main")?.unwrap_or_default();
     youtube::recover(&db)?;
     workflow::recover(&db)?;
-    if !library.root.is_empty() && std::path::Path::new(&library.root) != config.library {
+    // Legacy single-library guard: only enforce when a library root was
+    // recorded in the old schema AND differs from the current --library path.
+    // New installations (multi-library model) will have an empty root and skip this.
+    if !library.root.is_empty()
+        && config.library.exists()
+        && std::path::Path::new(&library.root) != config.library
+    {
         bail!("当前数据目录属于另一个素材库，请使用独立 --data 目录");
     }
     for mut job in db.list::<Job>("job")? {

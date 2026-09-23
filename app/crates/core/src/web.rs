@@ -19,6 +19,7 @@ use tower_http::services::ServeFile;
 #[derive(RustEmbed)]
 #[folder = "../../web/dist/"]
 struct Ui;
+#[derive(Debug)]
 pub(crate) struct ApiError(anyhow::Error);
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(e: E) -> Self {
@@ -41,6 +42,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/session", post(session))
         .merge(crate::youtube::router())
         .merge(crate::workflow::router())
+        .merge(crate::library::router())
         .route("/api/snapshot", get(snapshot))
         .route("/api/status", get(status))
         .route("/api/tasks", get(tasks))

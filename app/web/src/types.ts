@@ -9,3 +9,68 @@ export type TaskAction = 'cancel'|'pause'|'resume'|'retry';
 export interface UnifiedTask {id:string;source_id:string;kind:'media'|'upload';status:string;title:string;created_at:string|null;updated_at:string|null;progress:number|null;message:string;capabilities:Record<TaskAction,boolean>;plan_id?:string;artifact_id?:string;video_id?:string;bytes?:number;offset?:number;completed_outputs?:Job['completed_outputs']}
 export interface TaskSnapshot {tasks:UnifiedTask[];scan:Scan}
 export interface Snapshot {library:{root:string;scanned_at:string|null;assets:Asset[];rooms:Room[];sidecar_count:number;errors:string[]};scan:Scan;jobs:Job[];plans:Plan[];settings:Record<string,string>}
+
+// ── Multi-library types (v0.8+) ────────────────────────────────────────────
+
+export type LibraryKind = 'liverec' | 'folder' | 'webdav' | 'openlist';
+
+export interface LibraryRoot {
+  id: string;
+  name: string;
+  kind: LibraryKind;
+  path: string;
+  displayTz: string;
+  readonly: boolean;
+  enabled: boolean;
+  scanExclude: string[];
+  createdAt: string;
+  lastScannedAt: string | null;
+  scanStatus: 'idle' | 'scanning' | 'offline' | 'error';
+  scanError: string | null;
+  assetCount: number;
+}
+
+export interface AssetV2 {
+  id: string;
+  libraryId: string;
+  sourcePath: string;
+  contentHash: string | null;
+  isLinked: boolean;
+  fileSize: number;
+  modifiedMs: number;
+  extension: string;
+  title: string;
+  displayTitle: string | null;
+  // liverec-compat
+  roomId: string | null;
+  roomName: string | null;
+  startedAt: string | null;
+  // tech info (filled async by ffprobe)
+  durationSec: number | null;
+  width: number | null;
+  height: number | null;
+  videoCodec: string | null;
+  resolution: string | null;
+  // publish metadata
+  pubTitle: string | null;
+  pubDescription: string | null;
+  pubTags: string[];
+  pubCategoryId: string;
+  pubPrivacy: string;
+  pubLanguage: string | null;
+  pubAudioLang: string | null;
+  customTags: string[];
+  uploadTargets: { platform: string; status: string; url?: string; uploadedAt?: string }[];
+  fileStatus: 'ok' | 'missing' | 'changed';
+}
+
+export interface LibraryListResponse {
+  libraries: LibraryRoot[];
+}
+
+export interface AssetListResponse {
+  assets: AssetV2[];
+  total: number;
+  page: number;
+  perPage: number;
+}

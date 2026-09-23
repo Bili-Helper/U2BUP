@@ -1,4 +1,4 @@
-# U2BUP 0.7.0
+# U2BUP 0.8.0-preview.1
 
 Rust + Tauri + Vue 的本机录播工作台原型。第一阶段面向现有 LiveRec 历史素材，原始录像保留，成品写入独立目录。
 
@@ -57,7 +57,7 @@ biliLive-tools 实时录制集成、AI、自动弹幕时间映射、任意格式
 
 ## Windows 便携包
 
-`dist/U2BUP-0.7.0-windows-x64/` 包含桌面程序、独立 Web 服务与 `resources/ffmpeg.exe`、`resources/ffprobe.exe`。
+`dist/U2BUP-<版本号>-windows-x64/` 包含桌面程序、独立 Web 服务与 `resources/ffmpeg.exe`、`resources/ffprobe.exe`。
 
 双击 `U2BUP.exe`。首次启动选择包含主播子目录的素材根目录；点击“扫描 LiveRec”。桌面数据存放于系统应用数据目录 `io.u2bup.desktop/data`，成品在同级 `exports`，根目录选择记录在 `library-root.txt`。
 
