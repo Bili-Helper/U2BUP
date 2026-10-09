@@ -1,8 +1,8 @@
-use crate::{jobs, media, model::*, planner, scanner, AppState};
+use crate::{catalog, jobs, media, model::*, planner, scanner, AppState};
 use anyhow::{anyhow, bail, Context};
 use axum::{
     body::Body,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -159,10 +159,50 @@ async fn ui(req: Request) -> Response {
         None => (StatusCode::NOT_FOUND, "Not found").into_response(),
     }
 }
-async fn snapshot(State(s): State<Arc<AppState>>) -> Result<Json<Value>> {
-    let library = s.library.read().await.clone();
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotQuery {
+    library_id: Option<String>,
+}
+async fn snapshot(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<SnapshotQuery>,
+) -> Result<Json<Value>> {
+    let (library, scan) = if let Some(id) = q.library_id {
+        let root: LibraryRoot = s.db.library_get(&id)?.context("素材库不存在")?;
+        let library = if root.last_scanned_at.is_none()
+            && s.db.asset_count_for_library(&id)? == 0
+            && std::path::Path::new(&root.path).canonicalize().ok()
+                == s.config.library.canonicalize().ok()
+            && std::path::Path::new(&root.path).exists()
+        {
+            s.library.read().await.clone()
+        } else {
+            catalog::project_library(&s.db, &root)?
+        };
+        let count = library.assets.len();
+        let scan = ScanStatus {
+            running: root.scan_status == "scanning",
+            completed: count,
+            total: count,
+            message: root.scan_error.unwrap_or_else(|| {
+                if root.scan_status == "scanning" {
+                    "正在扫描素材库".into()
+                } else {
+                    format!("已索引 {count} 个视频")
+                }
+            }),
+        };
+        (library, scan)
+    } else {
+        (
+            s.library.read().await.clone(),
+            s.scan_status.lock().await.clone(),
+        )
+    };
+    let library_path = library.root.clone();
     Ok(Json(
-        json!({"library":library,"scan":s.scan_status.lock().await.clone(),"jobs":s.db.list::<Job>("job")?,"plans":s.db.list::<Plan>("plan")?,"settings":{"library":s.config.library,"output":s.config.output,"data":s.config.data,"ffmpeg":s.config.ffmpeg,"ffprobe":s.config.ffprobe,"version":env!("CARGO_PKG_VERSION"),"mode":if s.config.headless {"Headless · 单用户"} else {"本机 · 单用户"}}}),
+        json!({"library":library,"scan":scan,"jobs":s.db.list::<Job>("job")?,"plans":s.db.list::<Plan>("plan")?,"settings":{"library":if library_path.is_empty() { s.config.library.to_string_lossy().into_owned() } else { library_path },"output":s.config.output,"data":s.config.data,"ffmpeg":s.config.ffmpeg,"ffprobe":s.config.ffprobe,"version":env!("CARGO_PKG_VERSION"),"mode":if s.config.headless {"Headless · 单用户"} else {"本机 · 单用户"}}}),
     ))
 }
 async fn status(State(s): State<Arc<AppState>>) -> Result<Json<Value>> {
@@ -302,7 +342,8 @@ async fn scan(State(s): State<Arc<AppState>>) -> Result<Json<Value>> {
     Ok(Json(json!({"accepted":true})))
 }
 async fn plan(State(s): State<Arc<AppState>>, Json(req): Json<PlanRequest>) -> Result<Json<Plan>> {
-    let p = planner::build(&*s.library.read().await, req)?;
+    let selected = catalog::selection(&s, &req.asset_ids).await?;
+    let p = planner::build(&selected, req)?;
     s.db.put("plan", &p.id, &p)?;
     Ok(Json(p))
 }
@@ -440,6 +481,324 @@ mod task_tests {
             .unwrap()
     }
 
+    fn seed_registered(s: &AppState, root: &std::path::Path) -> Asset {
+        let path = root.join("主播/merged/recording.mp4");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"registered-video").unwrap();
+        let root = LibraryRoot {
+            id: "registered".into(),
+            name: "外部录播".into(),
+            kind: LibraryKind::Folder,
+            path: root.canonicalize().unwrap().to_string_lossy().into_owned(),
+            display_tz: "Asia/Shanghai".into(),
+            readonly: false,
+            enabled: true,
+            scan_exclude: vec![],
+            created_at: now(),
+            last_scanned_at: Some(now()),
+            scan_status: "idle".into(),
+            scan_error: None,
+            asset_count: 1,
+        };
+        s.db.library_put(&root.id, &root).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let asset = AssetV2 {
+            id: "registered-asset".into(),
+            library_id: root.id.clone(),
+            source_path: path.canonicalize().unwrap().to_string_lossy().into_owned(),
+            title: "直播标题".into(),
+            extension: "mp4".into(),
+            room_id: Some("123456".into()),
+            room_name: Some("主播".into()),
+            started_at: Some("2026-09-25T09:53:02+08:00".into()),
+            time_source: Some("filename".into()),
+            file_status: "ok".into(),
+            file_size: meta.len(),
+            modified_ms: media::modified_ms(&meta),
+            custom_meta: Some(json!({"scanner":{"version":1,"role":"legacy","metadata":{
+                "duration":120.0,"width":1080,"height":1920,"codec":"h264","aspect":"9:16",
+                "signature":"sig","streams":[{"codec_type":"video","codec_name":"h264"}]
+            }}})),
+            ..Default::default()
+        };
+        let record = AssetRecord {
+            id: asset.id.clone(),
+            library_id: root.id.clone(),
+            source_path: asset.source_path.clone(),
+            content_hash: None,
+            pub_title: None,
+            custom_tags_json: None,
+            modified_ms: asset.modified_ms,
+            file_size: asset.file_size,
+            asset,
+        };
+        s.db.asset_put(&record).unwrap();
+        catalog::project_asset(&root, &record).unwrap()
+    }
+
+    async fn request_json(s: Arc<AppState>, path: &str, value: Value) -> Value {
+        let response = router(s)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("host", "127.0.0.1:4173")
+                    .header("authorization", "Bearer test-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(value.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn registered_library_snapshot_preview_plan_and_titles_use_its_own_root() {
+        let legacy = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let s = state(legacy.path(), false);
+        let asset = seed_registered(&s, external.path());
+        assert!(s.library.read().await.assets.is_empty());
+        let response = request(s.clone(), "GET", "/api/snapshot?libraryId=registered").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["library"]["assets"][0]["id"], asset.id);
+        assert_eq!(value["library"]["rooms"][0]["id"], "123456");
+        assert_eq!(value["scan"]["completed"], 1);
+        assert_eq!(
+            catalog::resolve_input(&s, &asset).await.unwrap(),
+            external
+                .path()
+                .join("主播/merged/recording.mp4")
+                .canonicalize()
+                .unwrap()
+        );
+
+        let response = router(s.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/assets/registered-asset/media")
+                    .header("host", "127.0.0.1:4173")
+                    .header("authorization", "Bearer test-session")
+                    .header("range", "bytes=1-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"egi"
+        );
+
+        let plan = request_json(
+            s.clone(),
+            "/api/plans",
+            json!({"asset_ids":[asset.id],"include_legacy":true}),
+        )
+        .await;
+        assert_eq!(plan["outputs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            plan["outputs"][0]["inputs"][0]["relative_path"],
+            asset.relative_path
+        );
+        let changes = request_json(
+            s.clone(),
+            "/api/titles/preview",
+            json!({"asset_ids":[asset.id],"template":"{主播} {日期} {标题}"}),
+        )
+        .await;
+        assert_eq!(changes[0]["after"], "主播 2026-09-25 直播标题");
+        request_json(s.clone(), "/api/titles/apply", changes).await;
+        assert_eq!(
+            catalog::asset(&s, &asset.id)
+                .await
+                .unwrap()
+                .display_title
+                .as_deref(),
+            Some("主播 2026-09-25 直播标题")
+        );
+        assert!(s.library.read().await.assets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn saved_plans_cannot_switch_roots_after_library_removal_or_record_changes() {
+        let legacy = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let s = state(legacy.path(), false);
+        let asset = seed_registered(&s, external.path());
+        let mut altered = asset.clone();
+        altered.relative_path = "different.mp4".into();
+        assert!(catalog::resolve_input(&s, &altered).await.is_err());
+        s.db.asset_delete_for_library("registered").unwrap();
+        s.db.library_delete("registered").unwrap();
+        assert!(catalog::resolve_input(&s, &asset).await.is_err());
+        let fallback = legacy.path().join(&asset.relative_path);
+        std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        std::fs::write(fallback, b"registered-video").unwrap();
+        assert!(catalog::resolve_input(&s, &asset).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn plan_keeps_unselected_recording_context_for_legacy_and_registered_libraries() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let s = state(temp.path(), false);
+        let mut clips = vec![];
+        for (id, offset, signature) in [("a", 0, "tall"), ("b", 100, "wide"), ("c", 200, "tall")] {
+            clips.push(Asset {
+                id: id.into(),
+                room_id: "123456".into(),
+                title: "直播标题".into(),
+                role: "source".into(),
+                started_at: Some(
+                    chrono::DateTime::from_timestamp(1_790_300_000 + offset, 0)
+                        .unwrap()
+                        .to_rfc3339(),
+                ),
+                bytes: 100,
+                metadata: Some(MediaInfo {
+                    duration: Some(100.0),
+                    signature: signature.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        s.library.write().await.assets = clips.clone();
+        let plan = request_json(s.clone(), "/api/plans", json!({"asset_ids":["a","c"]})).await;
+        assert_eq!(plan["outputs"].as_array().unwrap().len(), 2);
+        assert_eq!(plan["outputs"][1]["reason"], "中间有未纳入该连续段的素材");
+
+        let original = seed_registered(&s, external.path());
+        let base = s.db.asset_get(&original.id).unwrap().unwrap();
+        s.db.asset_delete_for_library("registered").unwrap();
+        for clip in clips {
+            let path = external.path().join(format!("{}.mp4", clip.id));
+            std::fs::write(&path, b"video").unwrap();
+            let mut record = base.clone();
+            record.id = format!("registered-{}", clip.id);
+            record.source_path = path.canonicalize().unwrap().to_string_lossy().into_owned();
+            record.asset.id = record.id.clone();
+            record.asset.source_path = record.source_path.clone();
+            record.asset.started_at = clip.started_at;
+            record.asset.custom_meta =
+                Some(json!({"scanner":{"version":1,"role":"source","metadata":clip.metadata}}));
+            s.db.asset_put(&record).unwrap();
+        }
+        let plan = request_json(
+            s,
+            "/api/plans",
+            json!({"asset_ids":["registered-a","registered-c"]}),
+        )
+        .await;
+        assert_eq!(plan["outputs"].as_array().unwrap().len(), 2);
+        assert_eq!(plan["outputs"][1]["reason"], "中间有未纳入该连续段的素材");
+    }
+
+    #[tokio::test]
+    async fn plan_rejects_cross_library_inputs_even_with_matching_room_and_streams() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let s = state(temp.path(), false);
+        let asset = seed_registered(&s, first.path());
+        let mut root: LibraryRoot = s.db.library_get("registered").unwrap().unwrap();
+        root.id = "second-library".into();
+        root.path = second
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        s.db.library_put(&root.id, &root).unwrap();
+        let mut record = s.db.asset_get(&asset.id).unwrap().unwrap();
+        let path = second.path().join("recording.mp4");
+        std::fs::write(&path, b"video").unwrap();
+        record.id = "second-asset".into();
+        record.library_id = root.id.clone();
+        record.source_path = path.canonicalize().unwrap().to_string_lossy().into_owned();
+        record.asset.id = record.id.clone();
+        record.asset.library_id = root.id;
+        record.asset.source_path = record.source_path.clone();
+        s.db.asset_put(&record).unwrap();
+        s.library.write().await.assets.push(Asset {
+            id: "legacy".into(),
+            ..asset.clone()
+        });
+        for other in ["second-asset", "legacy"] {
+            let response = router(s.clone())
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/api/plans")
+                        .header("host", "127.0.0.1:4173")
+                        .header("authorization", "Bearer test-session")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"asset_ids":[asset.id, other],"include_legacy":true})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("同一个素材库"));
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_default_root_keeps_legacy_assets_until_first_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let s = state(temp.path(), false);
+        seed_registered(&s, temp.path());
+        s.db.asset_delete_for_library("registered").unwrap();
+        let mut root: LibraryRoot = s.db.library_get("registered").unwrap().unwrap();
+        root.last_scanned_at = None;
+        s.db.library_put(&root.id, &root).unwrap();
+        s.library.write().await.assets.push(Asset {
+            id: "legacy".into(),
+            ..Default::default()
+        });
+        let response = request(s.clone(), "GET", "/api/snapshot?libraryId=registered").await;
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["library"]["assets"][0]["id"], "legacy");
+        root.last_scanned_at = Some(now());
+        s.db.library_put(&root.id, &root).unwrap();
+        let response = request(s, "GET", "/api/snapshot?libraryId=registered").await;
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(value["library"]["assets"].as_array().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn task_polling_needs_no_youtube_credentials_and_redacts_sessions() {
         let temp = tempfile::tempdir().unwrap();
@@ -563,18 +922,11 @@ mod task_tests {
     }
 }
 async fn asset(s: &AppState, id: &str) -> Result<Asset> {
-    Ok(s.library
-        .read()
-        .await
-        .assets
-        .iter()
-        .find(|a| a.id == id)
-        .cloned()
-        .context("素材不存在")?)
+    Ok(catalog::asset(s, id).await?)
 }
 async fn thumbnail(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Response> {
     let a = asset(&s, &id).await?;
-    let input = media::resolve_input(&s.config.library, &a.relative_path)?;
+    let input = catalog::resolve_input(&s, &a).await?;
     let dir = s.config.data.join("thumbnails");
     std::fs::create_dir_all(&dir)?;
     let thumb = dir.join(format!("{}-{}.jpg", a.id, a.modified_ms));
@@ -612,7 +964,7 @@ async fn video(
     if a.extension != "mp4" {
         return Err(anyhow!("本版浏览器直接预览仅支持 MP4；FLV 可查看缩略图及媒体参数").into());
     }
-    let path = media::resolve_input(&s.config.library, &a.relative_path)?;
+    let path = catalog::resolve_input(&s, &a).await?;
     Ok(ServeFile::new(path)
         .oneshot(req)
         .await
@@ -631,9 +983,7 @@ async fn refresh_room(
     if id.parse::<u64>().is_err() {
         return Err(anyhow!("不是有效 B 站房间号").into());
     }
-    if !s.library.read().await.rooms.iter().any(|r| r.id == id) {
-        return Err(anyhow!("直播间不存在").into());
-    }
+    let mut room = catalog::room(&s, &id).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
         .user_agent("Mozilla/5.0 U2BUP/0.1")
@@ -651,19 +1001,21 @@ async fn refresh_room(
         }
         Ok::<_,anyhow::Error>(online)
     }.await;
-    let mut l = s.library.write().await;
-    let r = l.rooms.iter_mut().find(|r| r.id == id).unwrap();
-    r.refreshed_at = Some(now());
+    room.refreshed_at = Some(now());
     match result {
         Ok(v) => {
-            r.online = Some(v);
-            r.refresh_error = None
+            room.online = Some(v);
+            room.refresh_error = None
         }
-        Err(e) => r.refresh_error = Some(format!("{e:#}")),
+        Err(e) => room.refresh_error = Some(format!("{e:#}")),
     };
-    let result = r.clone();
-    s.db.put("library", "main", &*l)?;
-    Ok(Json(result))
+    s.db.put("room-info", &id, &room)?;
+    let mut l = s.library.write().await;
+    if let Some(r) = l.rooms.iter_mut().find(|r| r.id == id) {
+        *r = room.clone();
+        s.db.put("library", "main", &*l)?;
+    }
+    Ok(Json(room))
 }
 
 #[derive(Deserialize)]
@@ -695,14 +1047,9 @@ async fn preview_titles(
     } else {
         None
     };
-    let l = s.library.read().await;
     let mut changes = Vec::new();
     for (index, id) in r.asset_ids.iter().enumerate() {
-        let a = l
-            .assets
-            .iter()
-            .find(|a| &a.id == id)
-            .context("素材已不存在")?;
+        let a = catalog::asset(&s, id).await?;
         let before = a.display_title.as_ref().unwrap_or(&a.title).clone();
         let date = a
             .started_at
@@ -747,13 +1094,8 @@ async fn apply_titles(
         .clone()
         .try_lock_owned()
         .map_err(|_| anyhow!("当前有任务运行，请稍后应用标题"))?;
-    let mut l = s.library.write().await;
     for c in &changes {
-        let a = l
-            .assets
-            .iter()
-            .find(|a| a.id == c.id)
-            .context("素材已不存在")?;
+        let a = catalog::asset(&s, &c.id).await?;
         if a.display_title.as_ref().unwrap_or(&a.title) != &c.before {
             return Err(anyhow!("标题已变化，请重新预览").into());
         }
@@ -762,12 +1104,7 @@ async fn apply_titles(
         }
     }
     for c in changes {
-        l.assets
-            .iter_mut()
-            .find(|a| a.id == c.id)
-            .unwrap()
-            .display_title = Some(c.after);
+        catalog::set_display_title(&s, &c.id, c.after).await?;
     }
-    s.db.put("library", "main", &*l)?;
     Ok(Json(json!({"ok":true})))
 }

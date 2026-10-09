@@ -2,6 +2,7 @@
 /.build-tools/
 /.playwright-cli/
 /biliLive-tools/
+/biliLiveTools/
 /docs/research/
 **/node_modules/
 **/.env

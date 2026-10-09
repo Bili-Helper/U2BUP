@@ -453,12 +453,7 @@ fn metadata_key(kind: &str, id: &str) -> String {
     format!("{kind}:{id}")
 }
 async fn local_fields(s: &AppState, id: &str) -> Result<Fields> {
-    let library = s.library.read().await;
-    let asset = library
-        .assets
-        .iter()
-        .find(|a| a.id == id)
-        .context("素材已不存在")?;
+    let asset = crate::catalog::asset(s, id).await?;
     let mut fields = if let Some(saved) =
         s.db.get::<Value>("workflow-metadata", &metadata_key("local", id))?
     {
@@ -678,12 +673,7 @@ async fn preview(State(s): State<Arc<AppState>>, Json(mut p): Json<Preview>) -> 
             if !candidate.time_seconds.is_finite() || candidate.time_seconds < 0.0 {
                 bail!("封面时间无效");
             }
-            let library = s.library.read().await;
-            let asset = library
-                .assets
-                .iter()
-                .find(|a| a.id == candidate.asset_id)
-                .context("封面素材不存在")?;
+            let asset = crate::catalog::asset(&s, &candidate.asset_id).await?;
             if item.kind == "youtube" && item.metadata["localAssetId"] != candidate.asset_id {
                 bail!("上传封面前需要明确绑定对应本地素材 localAssetId");
             }
@@ -698,7 +688,7 @@ async fn preview(State(s): State<Arc<AppState>>, Json(mut p): Json<Preview>) -> 
             {
                 bail!("所选帧超过素材时长");
             }
-            let path = crate::media::resolve_input(&s.config.library, &asset.relative_path)?;
+            let path = crate::catalog::resolve_input(&s, &asset).await?;
             candidate.modified_ms = crate::media::modified_ms(&std::fs::metadata(path)?);
             let url = candidate
                 .data_url
@@ -924,14 +914,7 @@ async fn apply_metadata(s: &AppState, run: &mut Run, index: usize) -> Result<()>
             item.actions.contains_key("metadata"),
         )?;
         checkpoint(s, run, index, "metadata", "running")?;
-        let mut library = s.library.write().await;
-        library
-            .assets
-            .iter_mut()
-            .find(|a| a.id == run.items[index].id)
-            .context("素材已不存在")?
-            .display_title = Some(fields.title.clone());
-        s.db.put("library", "main", &*library)?;
+        crate::catalog::set_display_title(s, &run.items[index].id, fields.title.clone()).await?;
     }
     let item = &run.items[index];
     let saved = json!({"id":item.id,"kind":item.kind,"fields":fields,"metadata":item.metadata,
@@ -1189,17 +1172,11 @@ async fn apply_thumbnail(s: &AppState, run: &mut Run, index: usize) -> Result<()
     {
         bail!("上次封面上传响应未知，不能自动重放；请在 Studio 核对后重新预览");
     }
-    let library = s.library.read().await;
-    let asset = library
-        .assets
-        .iter()
-        .find(|a| a.id == candidate.asset_id)
-        .context("封面素材已不存在")?;
-    let path = crate::media::resolve_input(&s.config.library, &asset.relative_path)?;
+    let asset = crate::catalog::asset(s, &candidate.asset_id).await?;
+    let path = crate::catalog::resolve_input(s, &asset).await?;
     if crate::media::modified_ms(&std::fs::metadata(path)?) != candidate.modified_ms {
         bail!("封面来源素材已变化，请重新选帧");
     }
-    drop(library);
     let bytes = tokio::fs::read(
         s.config
             .data

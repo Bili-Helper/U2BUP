@@ -45,7 +45,10 @@ export interface AssetV2 {
   roomId: string | null;
   roomName: string | null;
   startedAt: string | null;
-  // tech info (filled async by ffprobe)
+  timeSource: string | null;
+  sidecars: string[];
+  warnings: string[];
+  // Technical information cached during scanning.
   durationSec: number | null;
   width: number | null;
   height: number | null;
@@ -60,6 +63,7 @@ export interface AssetV2 {
   pubLanguage: string | null;
   pubAudioLang: string | null;
   customTags: string[];
+  customMeta: Record<string,unknown> | null;
   uploadTargets: { platform: string; status: string; url?: string; uploadedAt?: string }[];
   fileStatus: 'ok' | 'missing' | 'changed';
 }

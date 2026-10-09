@@ -44,7 +44,7 @@ interface AddPayload {
 
 const kindOptions: { value: LibraryKind; label: string; desc: string; icon: any }[] = [
   { value: 'liverec', label: 'BililiveRecorder 录播库', desc: '{room_id}-{主播名}/ 目录结构，含 XML 元数据', icon: Archive },
-  { value: 'folder',  label: '普通文件夹',              desc: '任意目录，扫描所有视频文件（mp4/mkv/ts 等）', icon: FolderOpen },
+  { value: 'folder',  label: '文件夹 / biliLive-tools', desc: '扫描视频，自动识别 biliLive-tools 录制资料与 merged 成品', icon: FolderOpen },
   { value: 'webdav',  label: 'WebDAV 挂载路径',         desc: '系统已挂载的 WebDAV 目录，只读模式', icon: Network },
   { value: 'openlist', label: 'OpenList / Alist 挂载', desc: '本地挂载点，只读模式', icon: Server },
 ];
