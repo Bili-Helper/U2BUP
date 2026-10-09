@@ -2,7 +2,7 @@ use crate::{db::Db, media, model::*, web::ApiError, AppState};
 use anyhow::{bail, Context, Result};
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -265,9 +265,12 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/youtube/disconnect", post(disconnect))
         .route("/api/youtube/sync", post(sync))
         .route("/api/youtube/uploads", post(enqueue))
+        .route("/api/youtube/direct", post(add_direct))
+        .route("/api/youtube/direct/{id}", delete(remove_direct))
         .route("/api/youtube/uploads/{id}/resume", post(resume))
         .route("/api/youtube/uploads/{id}/pause", post(pause))
         .route("/api/youtube/batches/preview", post(preview))
+        .route("/api/youtube/batches/local", post(preview_local))
         .route("/api/youtube/batches/{id}/apply", post(apply))
 }
 async fn snapshot(State(s): State<Arc<AppState>>) -> HttpResult<Value> {
@@ -276,7 +279,7 @@ async fn snapshot(State(s): State<Arc<AppState>>) -> HttpResult<Value> {
             "enabled": false, "reason": HEADLESS_REASON,
             "configured": false, "connected": false, "channel": null,
             "videos": [], "uploads": upload_summaries(&s.db)?,
-            "artifacts": s.db.list::<Artifact>("artifact")?, "batches": []
+            "artifacts": artifact_rows(&s).await?, "batches": []
         })));
     }
     let c = credentials(&s)?;
@@ -286,6 +289,7 @@ async fn snapshot(State(s): State<Arc<AppState>>) -> HttpResult<Value> {
             .into_iter()
             .filter_map(|v| v["id"].as_str().map(str::to_owned))
             .collect::<std::collections::HashSet<_>>();
+    let linked = linked_sources(&s.db, &c.channel_id)?;
     let videos =
         s.db.list::<Value>("yt-video")?
             .into_iter()
@@ -299,12 +303,13 @@ async fn snapshot(State(s): State<Arc<AppState>>) -> HttpResult<Value> {
                         .ok()
                         .flatten()
                         .unwrap_or(json!(""));
+                v["local_linked"] = json!(linked.contains_key(v["id"].as_str().unwrap_or("")));
                 v
             })
             .collect::<Vec<_>>();
     let uploads = upload_summaries(&s.db)?;
     Ok(Json(
-        json!({"enabled":true,"configured":!c.client_id.is_empty(),"connected":!c.access_token.is_empty(),"channel":s.db.get::<Value>("yt-channel","main")?,"last_sync":s.db.get::<Value>("yt-sync",&c.channel_id)?,"videos":videos,"uploads":uploads,"artifacts":s.db.list::<Artifact>("artifact")?,"batches":s.db.list::<Batch>("yt-batch")?}),
+        json!({"enabled":true,"configured":!c.client_id.is_empty(),"connected":!c.access_token.is_empty(),"channel":s.db.get::<Value>("yt-channel","main")?,"last_sync":s.db.get::<Value>("yt-sync",&c.channel_id)?,"videos":videos,"uploads":uploads,"artifacts":artifact_rows(&s).await?,"batches":s.db.list::<Batch>("yt-batch")?}),
     ))
 }
 // This polling endpoint only reads local state and never refreshes OAuth tokens.
@@ -638,6 +643,8 @@ fn validate_metadata(m: &Metadata) -> Result<()> {
 struct UploadJob {
     id: String,
     artifact_id: String,
+    #[serde(default)]
+    source_ids: Vec<String>,
     path: String,
     bytes: u64,
     modified_ms: u64,
@@ -698,10 +705,22 @@ async fn enqueue(State(s): State<Arc<AppState>>, Json(r): Json<Enqueue>) -> Http
         let a =
             s.db.get::<Artifact>("artifact", id)?
                 .context("成品不存在")?;
-        let path = std::path::Path::new(&a.path).canonicalize()?;
-        if !path.starts_with(&s.config.output) {
-            return Err(anyhow::anyhow!("成品必须位于输出目录").into());
-        }
+        let path = if let Some(asset_id) = a.output_id.strip_prefix(DIRECT_PREFIX) {
+            let fresh = direct_artifact(&s, asset_id).await?;
+            if fresh.path != a.path || fresh.bytes != a.bytes {
+                return Err(anyhow::anyhow!(
+                    "素材在加入上传准备后发生变化，请在素材库重新加入上传准备"
+                )
+                .into());
+            }
+            std::path::PathBuf::from(fresh.path)
+        } else {
+            let path = std::path::Path::new(&a.path).canonicalize()?;
+            if !path.starts_with(&s.config.output) {
+                return Err(anyhow::anyhow!("成品必须位于输出目录").into());
+            }
+            path
+        };
         let stat = std::fs::metadata(&path)?;
         if stat.len() != a.bytes || a.bytes > 256_000_000_000 || a.duration > 43200.0 {
             return Err(anyhow::anyhow!("成品已变化或超过 YouTube 上传限制").into());
@@ -710,12 +729,9 @@ async fn enqueue(State(s): State<Arc<AppState>>, Json(r): Json<Enqueue>) -> Http
         if r.use_workflow_metadata {
             let prepared = crate::workflow::prepared_upload(&s.db, &a.source_ids)?
                 .context("成品没有可继承的素材元信息")?;
-            let library = s.library.read().await;
             for source_id in &a.source_ids {
-                let source = library
-                    .assets
-                    .iter()
-                    .find(|asset| asset.id == *source_id)
+                let source = crate::catalog::asset(&s, source_id)
+                    .await
                     .context("成品来源素材已不存在，请重新检查上传元信息")?;
                 if source.display_title.as_ref().unwrap_or(&source.title) != &prepared.title {
                     return Err(anyhow::anyhow!(
@@ -729,18 +745,33 @@ async fn enqueue(State(s): State<Arc<AppState>>, Json(r): Json<Enqueue>) -> Http
             metadata.tags = prepared.tags;
             metadata.category_id = prepared.category_id;
             metadata.privacy = prepared.privacy;
+        } else if let Some(local) = local_publish(&s, &a.source_ids).await {
+            metadata.title = metadata.title.replace("{标题}", &local.title);
+            if metadata.description.trim().is_empty() {
+                metadata.description = local.description.unwrap_or_default();
+            }
+            if metadata.tags.is_empty() {
+                metadata.tags = local.tags;
+            }
         }
-        metadata.title = metadata.title.replace(
+        metadata.title = metadata.title.replace("{标题}", "{文件名}").replace(
             "{文件名}",
             path.file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .as_ref(),
         );
-        validate_metadata(&metadata)?;
+        validate_metadata(&metadata).with_context(|| {
+            format!(
+                "{}：{}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                metadata.title
+            )
+        })?;
         jobs.push(UploadJob {
             id: uuid::Uuid::new_v4().to_string(),
             artifact_id: id.clone(),
+            source_ids: a.source_ids.clone(),
             path: path.to_string_lossy().into(),
             bytes: a.bytes,
             modified_ms: media::modified_ms(&stat),
@@ -760,6 +791,238 @@ async fn enqueue(State(s): State<Arc<AppState>>, Json(r): Json<Enqueue>) -> Http
         schedule(s.clone(), j.clone()).await;
     }
     Ok(Json(json!({"queued":jobs.len()})))
+}
+/// Merged outputs take their publishing fields from the first source in recording order.
+async fn local_publish(s: &AppState, source_ids: &[String]) -> Option<crate::catalog::Publish> {
+    crate::catalog::publish(s, source_ids.first()?).await.ok()
+}
+async fn artifact_rows(s: &AppState) -> Result<Vec<Value>> {
+    let mut rows = Vec::new();
+    for a in s.db.list::<Artifact>("artifact")? {
+        let local = local_publish(s, &a.source_ids).await;
+        let mut row = serde_json::to_value(&a)?;
+        row["local_title"] = json!(local.as_ref().map(|l| &l.title));
+        row["local_description"] = json!(local.as_ref().and_then(|l| l.description.as_ref()));
+        row["local_tags"] = json!(local.map(|l| l.tags).unwrap_or_default());
+        rows.push(row);
+    }
+    Ok(rows)
+}
+/// Videos uploaded by this app, keyed by YouTube video ID, with their local sources.
+fn linked_sources(
+    db: &Db,
+    channel: &str,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let mut linked = std::collections::HashMap::new();
+    for j in db.list::<UploadJob>("yt-upload")? {
+        let Some(video) = j.video_id.filter(|_| j.channel_id == channel) else {
+            continue;
+        };
+        let sources = if j.source_ids.is_empty() {
+            db.get::<Artifact>("artifact", &j.artifact_id)?
+                .map(|a| a.source_ids)
+                .unwrap_or_default()
+        } else {
+            j.source_ids
+        };
+        if !sources.is_empty() {
+            linked.insert(video, sources);
+        }
+    }
+    Ok(linked)
+}
+#[derive(Deserialize)]
+struct LocalSync {
+    ids: Vec<String>,
+    #[serde(default)]
+    title: bool,
+    #[serde(default)]
+    description: bool,
+    #[serde(default)]
+    tags: bool,
+}
+async fn preview_local(
+    State(s): State<Arc<AppState>>,
+    Json(r): Json<LocalSync>,
+) -> HttpResult<Value> {
+    if !(r.title || r.description || r.tags) {
+        return Err(anyhow::anyhow!("至少选择一项要同步的字段").into());
+    }
+    if r.ids.is_empty() {
+        return Err(anyhow::anyhow!("请先选择频道视频").into());
+    }
+    let channel = credentials(&s)?.channel_id;
+    if channel.is_empty() {
+        return Err(anyhow::anyhow!("请先连接频道").into());
+    }
+    let linked = linked_sources(&s.db, &channel)?;
+    let (mut unlinked, mut unchanged, mut remaining) = (0usize, 0usize, 0usize);
+    let mut skipped = Vec::new();
+    let mut changes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for id in r.ids.iter().filter(|id| seen.insert(id.as_str())) {
+        let Some(sources) = linked.get(id) else {
+            unlinked += 1;
+            continue;
+        };
+        if changes.len() == 100 {
+            remaining += 1;
+            continue;
+        }
+        let v =
+            s.db.get::<Value>("yt-video", id)?
+                .context("请先同步频道视频")?;
+        if v["snippet"]["channelId"] != channel {
+            return Err(anyhow::anyhow!("视频不属于当前频道").into());
+        }
+        let Some(local) = local_publish(&s, sources).await else {
+            skipped.push(json!({"id": id, "reason": "本地来源素材已不存在"}));
+            continue;
+        };
+        let before = writable(&v, "snippet");
+        let mut snippet = before.clone();
+        if r.title {
+            snippet["title"] = json!(local.title.trim());
+        }
+        if let Some(d) = local.description.filter(|_| r.description) {
+            snippet["description"] = json!(d);
+        }
+        if r.tags && !local.tags.is_empty() {
+            snippet["tags"] = json!(local.tags);
+        }
+        if snippet == before {
+            unchanged += 1;
+            continue;
+        }
+        if let Err(e) = validate_snippet(&snippet) {
+            skipped.push(json!({"id": id, "reason": format!("{e:#}")}));
+            continue;
+        }
+        changes.push(Change {
+            id: id.clone(),
+            before: v,
+            after: json!({"id": id, "snippet": snippet}),
+            part: "snippet".into(),
+            status: "pending".into(),
+            message: String::new(),
+        });
+    }
+    let batch = if changes.is_empty() {
+        None
+    } else {
+        let b = Batch {
+            id: uuid::Uuid::new_v4().to_string(),
+            channel_id: channel,
+            changes,
+        };
+        s.db.put("yt-batch", &b.id, &b)?;
+        Some(b)
+    };
+    Ok(Json(json!({
+        "batch": batch, "unlinked": unlinked, "unchanged": unchanged,
+        "skipped": skipped, "remaining": remaining
+    })))
+}
+/// Library files uploaded as-is are registered as artifacts that point at the
+/// original file; their binding is rechecked against the library on enqueue.
+const DIRECT_PREFIX: &str = "direct-";
+const DIRECT_VALIDATION: &str = "素材库直传：未合并、未转码，按源文件原样上传";
+const DIRECT_EXTENSIONS: [&str; 6] = ["mp4", "mov", "mkv", "flv", "webm", "ts"];
+fn content_type(path: &str) -> &'static str {
+    let extension = std::path::Path::new(path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "flv" => "video/x-flv",
+        "webm" => "video/webm",
+        "ts" => "video/mp2t",
+        _ => "video/mp4",
+    }
+}
+async fn direct_artifact(s: &AppState, asset_id: &str) -> Result<Artifact> {
+    let asset = crate::catalog::asset(s, asset_id).await?;
+    let extension = asset.extension.to_ascii_lowercase();
+    if !DIRECT_EXTENSIONS.contains(&extension.as_str()) {
+        bail!("{} 格式不支持直接上传", extension.to_uppercase());
+    }
+    let duration = asset
+        .metadata
+        .as_ref()
+        .and_then(|m| m.duration)
+        .context("时长未知，请重新扫描素材库后再试")?;
+    if duration > 43200.0 {
+        bail!("时长超过 12 小时，请先生成合并计划自动切割");
+    }
+    let path = crate::catalog::resolve_input(s, &asset).await?;
+    let bytes = std::fs::metadata(&path)?.len();
+    if bytes != asset.bytes {
+        bail!("文件大小与索引不一致，请重新扫描素材库");
+    }
+    if bytes > 256_000_000_000 {
+        bail!("超过 YouTube 单文件 256 GB 上限");
+    }
+    Ok(Artifact {
+        output_id: format!("{DIRECT_PREFIX}{}", asset.id),
+        path: path.to_string_lossy().into(),
+        bytes,
+        duration,
+        validation: DIRECT_VALIDATION.into(),
+        source_ids: vec![asset.id],
+    })
+}
+#[derive(Deserialize)]
+struct DirectRequest {
+    asset_ids: Vec<String>,
+}
+async fn add_direct(
+    State(s): State<Arc<AppState>>,
+    Json(r): Json<DirectRequest>,
+) -> HttpResult<Value> {
+    if s.config.headless {
+        return Err(anyhow::anyhow!(HEADLESS_REASON).into());
+    }
+    if r.asset_ids.is_empty() || r.asset_ids.len() > 500 {
+        return Err(anyhow::anyhow!("每次选择 1–500 个素材").into());
+    }
+    let _queue = s.youtube.queue.lock().await;
+    let (mut added, mut existing) = (0usize, 0usize);
+    let mut rejected = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for id in r.asset_ids.iter().filter(|id| seen.insert(id.as_str())) {
+        match direct_artifact(&s, id).await {
+            Ok(a) => {
+                if s.db.get::<Artifact>("artifact", &a.output_id)?.is_some() {
+                    existing += 1;
+                } else {
+                    added += 1;
+                }
+                s.db.put("artifact", &a.output_id, &a)?;
+            }
+            Err(e) => {
+                let name = crate::catalog::asset(&s, id)
+                    .await
+                    .map(|a| a.name)
+                    .unwrap_or_else(|_| id.clone());
+                rejected.push(json!({"id": id, "name": name, "reason": e.to_string()}));
+            }
+        }
+    }
+    Ok(Json(
+        json!({"added": added, "existing": existing, "rejected": rejected}),
+    ))
+}
+async fn remove_direct(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> HttpResult<Value> {
+    if !id.starts_with(DIRECT_PREFIX) {
+        return Err(anyhow::anyhow!("只能移出素材库直传项；合并成品请在输出目录管理").into());
+    }
+    let _queue = s.youtube.queue.lock().await;
+    Ok(Json(json!({"removed": s.db.delete("artifact", &id)?})))
 }
 async fn schedule(s: Arc<AppState>, mut j: UploadJob) {
     let cancel = CancellationToken::new();
@@ -878,7 +1141,7 @@ async fn upload(s: &AppState, j: &mut UploadJob) -> Result<()> {
     j.message = "连接 YouTube 断点上传服务".into();
     save_upload(&s.db, j)?;
     if j.session.is_none() {
-        let r=client()?.post(endpoint(s, UPLOAD)).query(&[("uploadType","resumable"),("part","snippet,status"),("notifySubscribers","false")]).bearer_auth(access(s).await?).header("X-Upload-Content-Length",j.bytes).header("X-Upload-Content-Type","video/mp4").json(&json!({"snippet":{"title":j.metadata.title,"description":j.metadata.description,"tags":j.metadata.tags,"categoryId":j.metadata.category_id},"status":{"privacyStatus":j.metadata.privacy,"selfDeclaredMadeForKids":j.metadata.made_for_kids}})).send().await.map_err(|_|anyhow::anyhow!("创建上传会话网络失败，尚未发送媒体数据"))?;
+        let r=client()?.post(endpoint(s, UPLOAD)).query(&[("uploadType","resumable"),("part","snippet,status"),("notifySubscribers","false")]).bearer_auth(access(s).await?).header("X-Upload-Content-Length",j.bytes).header("X-Upload-Content-Type",content_type(&j.path)).json(&json!({"snippet":{"title":j.metadata.title,"description":j.metadata.description,"tags":j.metadata.tags,"categoryId":j.metadata.category_id},"status":{"privacyStatus":j.metadata.privacy,"selfDeclaredMadeForKids":j.metadata.made_for_kids}})).send().await.map_err(|_|anyhow::anyhow!("创建上传会话网络失败，尚未发送媒体数据"))?;
         if !r.status().is_success() {
             checked(r).await?;
             bail!("创建上传会话失败");
@@ -917,7 +1180,7 @@ async fn upload(s: &AppState, j: &mut UploadJob) -> Result<()> {
             let mut bytes = vec![0; len];
             file.read_exact(&mut bytes).await?;
             request = request
-                .header("Content-Type", "video/mp4")
+                .header("Content-Type", content_type(&j.path))
                 .header(
                     "Content-Range",
                     format!(
@@ -1051,6 +1314,24 @@ pub(crate) fn writable(v: &Value, part: &str) -> Value {
     }
     Value::Object(map)
 }
+fn validate_snippet(snippet: &Value) -> Result<()> {
+    validate_metadata(&Metadata {
+        title: snippet["title"].as_str().context("远端标题缺失")?.into(),
+        description: snippet["description"].as_str().unwrap_or("").into(),
+        tags: serde_json::from_value(
+            snippet["tags"]
+                .as_array()
+                .map(|a| json!(a))
+                .unwrap_or(json!([])),
+        )?,
+        privacy: private(),
+        category_id: snippet["categoryId"]
+            .as_str()
+            .context("远端分类缺失")?
+            .into(),
+        made_for_kids: false,
+    })
+}
 fn edit_video(v: &Value, r: &Edit) -> Result<(Value, String)> {
     let mut out = json!({"id":v["id"]});
     let mut parts = Vec::new();
@@ -1073,23 +1354,7 @@ fn edit_video(v: &Value, r: &Edit) -> Result<(Value, String)> {
         if let Some(t) = &r.tags {
             snippet["tags"] = json!(t);
         }
-        let m = Metadata {
-            title: snippet["title"].as_str().unwrap().into(),
-            description: snippet["description"].as_str().unwrap_or("").into(),
-            tags: serde_json::from_value(
-                snippet["tags"]
-                    .as_array()
-                    .map(|a| json!(a))
-                    .unwrap_or(json!([])),
-            )?,
-            privacy: private(),
-            category_id: snippet["categoryId"]
-                .as_str()
-                .context("远端分类缺失")?
-                .into(),
-            made_for_kids: false,
-        };
-        validate_metadata(&m)?;
+        validate_snippet(&snippet)?;
         out["snippet"] = snippet;
         parts.push("snippet");
     }
@@ -1385,6 +1650,7 @@ pub(crate) mod protocol_tests {
         let mut j = UploadJob {
             id: "job".into(),
             artifact_id: "artifact".into(),
+            source_ids: vec![],
             path: path.to_string_lossy().into(),
             bytes: bytes.len() as u64,
             modified_ms: media::modified_ms(&stat),
@@ -1432,6 +1698,163 @@ pub(crate) mod protocol_tests {
             .to_string()
             .contains("变化"));
         server.abort();
+    }
+    #[tokio::test]
+    async fn direct_library_files_are_registered_in_place_and_rechecked_before_upload() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("主播")).unwrap();
+        std::fs::write(root.join("主播/a.mp4"), b"video").unwrap();
+        std::fs::write(root.join("主播/b.mp4"), b"video").unwrap();
+        let mut s = state(&root, "http://127.0.0.1:9".into());
+        s.config.output = root.join("output");
+        let asset = |id: &str, file: &str, duration: Option<f64>| Asset {
+            id: id.into(),
+            relative_path: format!("主播/{file}"),
+            name: file.into(),
+            bytes: 5,
+            extension: "mp4".into(),
+            metadata: Some(MediaInfo {
+                duration,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        s.library.write().await.assets = vec![
+            asset("ready", "a.mp4", Some(60.0)),
+            asset("unknown", "b.mp4", None),
+        ];
+        let s = Arc::new(s);
+        let request = |ids: &[&str]| {
+            Json(DirectRequest {
+                asset_ids: ids.iter().map(|id| id.to_string()).collect(),
+            })
+        };
+        let Json(result) = add_direct(State(s.clone()), request(&["ready", "unknown", "ready"]))
+            .await
+            .unwrap();
+        assert_eq!(result["added"], 1);
+        assert_eq!(result["rejected"][0]["name"], "b.mp4");
+        assert!(result["rejected"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("时长未知"));
+        let saved =
+            s.db.get::<Artifact>("artifact", "direct-ready")
+                .unwrap()
+                .unwrap();
+        assert_eq!(std::path::Path::new(&saved.path), root.join("主播/a.mp4"));
+        assert_eq!(saved.source_ids, vec!["ready".to_string()]);
+        let Json(again) = add_direct(State(s.clone()), request(&["ready"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            (again["added"].clone(), again["existing"].clone()),
+            (json!(0), json!(1))
+        );
+
+        std::fs::write(root.join("主播/a.mp4"), b"changed video").unwrap();
+        let enqueue_request: Enqueue = serde_json::from_value(json!({
+            "artifact_ids": ["direct-ready"],
+            "metadata": {"title": "{文件名}", "made_for_kids": false}
+        }))
+        .unwrap();
+        assert!(direct_artifact(&s, "ready")
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("大小"));
+        assert!(enqueue(State(s.clone()), Json(enqueue_request))
+            .await
+            .is_err());
+        assert!(s.db.list::<UploadJob>("yt-upload").unwrap().is_empty());
+
+        assert!(remove_direct(State(s.clone()), Path("plan-output".into()))
+            .await
+            .is_err());
+        let Json(removed) = remove_direct(State(s.clone()), Path("direct-ready".into()))
+            .await
+            .unwrap();
+        assert_eq!(removed["removed"], true);
+        assert_eq!(content_type("x/录像.FLV"), "video/x-flv");
+    }
+    #[tokio::test]
+    async fn uploads_use_library_titles_and_uploaded_videos_sync_back_from_local_titles() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("主播")).unwrap();
+        std::fs::write(root.join("主播/a.mp4"), b"video").unwrap();
+        let s = state(&root, "http://127.0.0.1:9".into());
+        s.library.write().await.assets = vec![Asset {
+            id: "ready".into(),
+            relative_path: "主播/a.mp4".into(),
+            name: "a.mp4".into(),
+            title: "直播间标题".into(),
+            display_title: Some("【主播】整理后的标题".into()),
+            bytes: 5,
+            extension: "mp4".into(),
+            metadata: Some(MediaInfo {
+                duration: Some(60.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let s = Arc::new(s);
+        let Json(added) = add_direct(
+            State(s.clone()),
+            Json(DirectRequest {
+                asset_ids: vec!["ready".into()],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(added["added"], 1);
+        let rows = artifact_rows(&s).await.unwrap();
+        assert_eq!(rows[0]["local_title"], "【主播】整理后的标题");
+
+        let held = s.youtube.operation.lock().await;
+        let request: Enqueue = serde_json::from_value(json!({
+            "artifact_ids": ["direct-ready"],
+            "metadata": {"title": "{标题}", "tags": ["表单标签"], "made_for_kids": false}
+        }))
+        .unwrap();
+        let Json(queued) = enqueue(State(s.clone()), Json(request)).await.unwrap();
+        assert_eq!(queued["queued"], 1);
+        let mut job = s.db.list::<UploadJob>("yt-upload").unwrap().remove(0);
+        assert_eq!(job.metadata.title, "【主播】整理后的标题");
+        assert_eq!(job.metadata.tags, vec!["表单标签".to_string()]);
+        assert_eq!(job.source_ids, vec!["ready".to_string()]);
+        s.shutdown.cancel();
+        drop(held);
+
+        job.status = "completed".into();
+        job.video_id = Some("uploaded".into());
+        s.db.put("yt-upload", &job.id, &job).unwrap();
+        s.db.put(
+            "yt-video",
+            "uploaded",
+            &json!({"id":"uploaded","snippet":{"channelId":"channel","title":"a","description":"keep","categoryId":"22"},"status":{"privacyStatus":"private"}}),
+        )
+        .unwrap();
+        s.library.write().await.assets[0].display_title = Some("【主播】再次修改".into());
+        let sync = |title: bool| {
+            Json(LocalSync {
+                ids: vec!["uploaded".into(), "elsewhere".into()],
+                title,
+                description: true,
+                tags: false,
+            })
+        };
+        let Json(result) = preview_local(State(s.clone()), sync(true)).await.unwrap();
+        assert_eq!(result["unlinked"], 1);
+        let change = &result["batch"]["changes"][0];
+        assert_eq!(change["after"]["snippet"]["title"], "【主播】再次修改");
+        assert_eq!(change["after"]["snippet"]["description"], "keep");
+        assert_eq!(change["part"], "snippet");
+        let Json(nothing) = preview_local(State(s.clone()), sync(false)).await.unwrap();
+        assert!(nothing["batch"].is_null());
+        assert_eq!(nothing["unchanged"], 1);
     }
     #[tokio::test]
     async fn channel_sync_deduplicates_pages_and_preserves_the_previous_list_on_token_cycles() {

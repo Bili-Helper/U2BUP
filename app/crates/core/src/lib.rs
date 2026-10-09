@@ -1,3 +1,4 @@
+mod catalog;
 mod db;
 mod jobs;
 pub mod library;

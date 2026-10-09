@@ -1,4 +1,4 @@
-use crate::{media, model::*, AppState};
+use crate::{catalog, media, model::*, AppState};
 use anyhow::{bail, Context, Result};
 use std::{path::Path, process::Stdio, sync::Arc};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -16,7 +16,7 @@ pub async fn execute(state: Arc<AppState>, plan: Plan, mut job: Job, cancel: Can
         save(&state,&mut job)?;
         // Validate every input before producing any output.
         for o in &plan.outputs {for a in &o.inputs {
-            let p=media::resolve_input(&state.config.library,&a.relative_path)?;
+            let p=catalog::resolve_input(&state,a).await?;
             let m=std::fs::metadata(p)?;
             if m.len()!=a.bytes||media::modified_ms(&m)!=a.modified_ms {bail!("源文件已变化，请重新扫描和生成计划：{}",a.name);}
         }}
@@ -43,13 +43,13 @@ pub async fn execute(state: Arc<AppState>, plan: Plan, mut job: Job, cancel: Can
             let list=target_dir.join(format!(".concat-{}.txt",job.id));
             let log_path=target_dir.join(format!("{}.ffmpeg.log",job.id));
             let mut contents=String::new();
-            for a in &o.inputs {contents.push_str(&media::concat_line(&media::resolve_input(&state.config.library,&a.relative_path)?)?);}
+            for a in &o.inputs {contents.push_str(&media::concat_line(&catalog::resolve_input(&state,a).await?)?);}
             std::fs::write(&list,contents)?;
             let log=std::fs::File::create(&log_path)?;
             let mut command=media::command(&state.config.ffmpeg);
             command.args(["-hide_banner","-nostdin","-v","warning"]);
             if let Some(offset)=o.cut_start {
-                let input=media::resolve_input(&state.config.library,&o.inputs[0].relative_path)?;
+                let input=catalog::resolve_input(&state,&o.inputs[0]).await?;
                 let audio_count=o.inputs[0].metadata.as_ref().unwrap().streams.iter().filter(|s|s["codec_type"]=="audio").count() as u64;
                 let budget=(plan.request.max_bytes as f64*8.0*0.85/o.duration) as u64;
                 let video_rate=budget.saturating_sub(audio_count*192_000).min(20_000_000);

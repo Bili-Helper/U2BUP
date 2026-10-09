@@ -2,7 +2,7 @@
 //! the `folder` / `webdav` / `openlist` scanner.
 //! The legacy `liverec` scanner lives in `scanner.rs` and is called from `web.rs`.
 
-use crate::{db::Db, model::*, web::ApiError, AppState};
+use crate::{db::Db, media, model::*, scanner, web::ApiError, AppState};
 use anyhow::{bail, Context, Result};
 use axum::{
     extract::{Path, Query, State},
@@ -206,6 +206,11 @@ async fn trigger_scan(State(s): State<Arc<AppState>>, Path(id): Path<String>) ->
     if lib.scan_status == "scanning" {
         bail_api!("该素材库正在扫描中");
     }
+    let permit = s
+        .operation
+        .clone()
+        .try_lock_owned()
+        .context("已有扫描、合并或改名任务，请等待完成")?;
     // Mark as scanning.
     {
         let mut lib2 = lib.clone();
@@ -218,18 +223,10 @@ async fn trigger_scan(State(s): State<Arc<AppState>>, Path(id): Path<String>) ->
     let state = s.clone();
     let lib_id = id.clone();
     tokio::spawn(async move {
-        let result = match lib.kind {
-            LibraryKind::Liverec => {
-                // Legacy liverec scan is handled by the existing web.rs /api/scan route.
-                // Here we just report that it should be triggered via that route.
-                Err(anyhow::anyhow!(
-                    "liverec 库请使用 /api/scan 路由触发扫描（兼容模式）"
-                ))
-            }
-            LibraryKind::Folder | LibraryKind::Webdav | LibraryKind::Openlist => {
-                scan_folder_library(&state.db, &lib).await
-            }
-        };
+        let _permit = permit;
+        // Registered recorder libraries use their own root rather than the
+        // process-wide legacy /api/scan root.
+        let result = scan_folder_library(&state.db, &lib, &state.config.ffprobe).await;
         let mut lib_updated: LibraryRoot = match state.db.library_get(&lib_id) {
             Ok(Some(l)) => l,
             _ => return,
@@ -254,7 +251,7 @@ async fn trigger_scan(State(s): State<Arc<AppState>>, Path(id): Path<String>) ->
 
 /// Scan a folder-type library, writing discovered video files into `assets_v2`.
 /// Returns the total number of assets found (new + existing).
-async fn scan_folder_library(db: &Db, lib: &LibraryRoot) -> Result<usize> {
+async fn scan_folder_library(db: &Db, lib: &LibraryRoot, ffprobe: &path::Path) -> Result<usize> {
     let root = path::Path::new(&lib.path);
     if !root.exists() {
         // Mark library as offline rather than erroring out.
@@ -323,24 +320,66 @@ async fn scan_folder_library(db: &Db, lib: &LibraryRoot) -> Result<usize> {
             format!("{:x}", h.finalize())[..20].to_string()
         };
 
-        // Skip if file hasn't changed (same size + mtime).
-        if let Ok(Some(existing)) = db.asset_get(&id) {
-            if existing.modified_ms == modified_ms && existing.file_size == file_size {
-                found += 1;
-                continue;
-            }
-        }
+        // Recorder XML can be added or corrected independently of the video.
+        // Refresh descriptive metadata even if size + mtime are unchanged.
+        let existing = db.asset_get(&id)?;
+        let unchanged = existing
+            .as_ref()
+            .is_some_and(|e| e.modified_ms == modified_ms && e.file_size == file_size);
 
         // Compute fast content hash.
-        let content_hash = fast_file_hash(path).ok();
+        let content_hash = if unchanged {
+            existing.as_ref().and_then(|e| e.content_hash.clone())
+        } else {
+            fast_file_hash(path).ok()
+        };
 
-        let title = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
+        let recording = scanner::recording_info(root, path);
+        let mut warnings = recording.warnings;
+        let cached_media: Option<MediaInfo> = existing
+            .as_ref()
+            .filter(|_| unchanged)
+            .and_then(|e| e.asset.custom_meta.as_ref())
+            .and_then(|m| m.get("scanner"))
+            .and_then(|m| m.get("metadata"))
+            .and_then(|m| serde_json::from_value(m.clone()).ok());
+        let metadata = match cached_media {
+            Some(metadata) => Some(metadata),
+            None => match media::probe(ffprobe, path).await {
+                Ok(metadata) => Some(metadata),
+                Err(e) => {
+                    warnings.push(format!("探测失败：{e}"));
+                    None
+                }
+            },
+        };
+        if metadata.as_ref().and_then(|m| m.duration).is_none() {
+            warnings.push("时长未知，暂不能自动合并".into());
+        }
 
-        let asset = AssetV2 {
+        // Preserve user edits, publishing fields and upload records on rescan.
+        let mut asset = existing
+            .as_ref()
+            .map(|e| e.asset.clone())
+            .unwrap_or_else(|| AssetV2 {
+                pub_category_id: "22".into(),
+                pub_privacy: "private".into(),
+                ..Default::default()
+            });
+        let mut custom_meta = match asset.custom_meta.take() {
+            Some(Value::Object(m)) => m,
+            Some(value) => serde_json::Map::from_iter([("userValue".into(), value)]),
+            None => serde_json::Map::new(),
+        };
+        custom_meta.insert(
+            "scanner".into(),
+            json!({
+                "version": 1,
+                "role": recording.role,
+                "metadata": metadata,
+            }),
+        );
+        asset = AssetV2 {
             id: id.clone(),
             library_id: lib.id.clone(),
             source_path: source_path.clone(),
@@ -349,32 +388,28 @@ async fn scan_folder_library(db: &Db, lib: &LibraryRoot) -> Result<usize> {
             file_size,
             modified_ms,
             extension: ext,
-            title: title.clone(),
-            display_title: None,
-            room_id: None,
-            room_name: None,
-            started_at: None,
-            time_source: Some("mtime".into()),
-            sidecars: vec![],
-            warnings: vec![],
-            // Tech info left empty; filled by async ffprobe (future).
-            duration_sec: None,
-            width: None,
-            height: None,
-            video_codec: None,
-            resolution: None,
-            // Publish metadata starts empty.
-            pub_title: None,
-            pub_description: None,
-            pub_tags: vec![],
-            pub_category_id: "22".into(),
-            pub_privacy: "private".into(),
-            pub_language: None,
-            pub_audio_lang: None,
-            custom_tags: vec![],
-            custom_meta: None,
-            upload_targets: vec![],
+            title: recording.title,
+            room_id: recording.room_id,
+            room_name: recording.room_name,
+            started_at: recording.started_at,
+            time_source: Some(recording.time_source),
+            sidecars: recording
+                .sidecars
+                .iter()
+                .filter_map(|p| p.strip_prefix(root).ok())
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            warnings,
+            duration_sec: metadata.as_ref().and_then(|m| m.duration),
+            width: metadata.as_ref().map(|m| m.width),
+            height: metadata.as_ref().map(|m| m.height),
+            video_codec: metadata.as_ref().map(|m| m.codec.clone()),
+            resolution: metadata
+                .as_ref()
+                .map(|m| format!("{}x{}", m.width, m.height)),
+            custom_meta: Some(Value::Object(custom_meta)),
             file_status: "ok".into(),
+            ..asset
         };
 
         let record = AssetRecord {
@@ -382,8 +417,8 @@ async fn scan_folder_library(db: &Db, lib: &LibraryRoot) -> Result<usize> {
             library_id: lib.id.clone(),
             source_path,
             content_hash,
-            pub_title: None,
-            custom_tags_json: None,
+            pub_title: asset.pub_title.clone(),
+            custom_tags_json: Some(serde_json::to_string(&asset.custom_tags)?),
             modified_ms,
             file_size,
             asset,
@@ -498,6 +533,11 @@ async fn update_asset_meta(
     Path(id): Path<String>,
     Json(body): Json<UpdateMetaBody>,
 ) -> HttpResult<Value> {
+    let _permit = s
+        .operation
+        .clone()
+        .try_lock_owned()
+        .context("已有扫描、合并或改名任务，请等待完成")?;
     let mut record = s.db.asset_get(&id)?.context("素材不存在")?;
     let a = &mut record.asset;
 
@@ -608,7 +648,25 @@ mod tests {
     }
 
     fn make_state(dir: &std::path::Path) -> Arc<crate::AppState> {
-        Arc::new(crate::youtube::protocol_tests::state(dir, String::new()))
+        let mut state = crate::youtube::protocol_tests::state(dir, String::new());
+        // These scanner tests use placeholder media, not valid video fixtures.
+        state.config.ffprobe = dir.join("test-ffprobe-unavailable");
+        Arc::new(state)
+    }
+
+    async fn wait_scan(s: &AppState, id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let lib: LibraryRoot = s.db.library_get(id).unwrap().unwrap();
+                if lib.scan_status != "scanning" {
+                    assert_eq!(lib.scan_status, "idle", "{:?}", lib.scan_error);
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("library scan did not finish");
     }
 
     fn lib_body(name: &str, kind: LibraryKind, path: &str) -> CreateLibraryBody {
@@ -822,12 +880,11 @@ mod tests {
         .unwrap();
         let lib_id = resp.0["library"]["id"].as_str().unwrap().to_string();
 
-        // Trigger scan (this runs inline via tokio::spawn inside trigger_scan,
-        // so we give the task a moment to complete).
-        trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
+        // Trigger the background scan and wait for its completion status.
+        let _ = trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
             .await
             .unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_scan(&s, &lib_id).await;
 
         // Check asset count.
         let count = s.db.asset_count_for_library(&lib_id).unwrap();
@@ -854,10 +911,10 @@ mod tests {
         let resp = create_library(State(s.clone()), Json(body)).await.unwrap();
         let lib_id = resp.0["library"]["id"].as_str().unwrap().to_string();
 
-        trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
+        let _ = trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
             .await
             .unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_scan(&s, &lib_id).await;
 
         let count = s.db.asset_count_for_library(&lib_id).unwrap();
         assert_eq!(count, 1, "only keep.mp4 should be indexed");
@@ -883,19 +940,108 @@ mod tests {
         .unwrap();
         let lib_id = resp.0["library"]["id"].as_str().unwrap().to_string();
 
-        trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
+        let _ = trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
             .await
             .unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_scan(&s, &lib_id).await;
         assert_eq!(s.db.asset_count_for_library(&lib_id).unwrap(), 1);
 
         // Add a second file and re-scan.
         fs::write(media.join("b.mkv"), b"video b").unwrap();
-        trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
+        let _ = trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
             .await
             .unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_scan(&s, &lib_id).await;
         assert_eq!(s.db.asset_count_for_library(&lib_id).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn recorder_scan_refreshes_xml_and_preserves_user_edits_and_probe_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("media");
+        let room = media.join("主播甲");
+        fs::create_dir_all(room.join("merged")).unwrap();
+        let video = room.join("merged/主播甲_20261005_085403_直播标题_[9x16].mp4");
+        fs::write(&video, b"video data").unwrap();
+        let s = make_state(tmp.path());
+        let resp = create_library(
+            State(s.clone()),
+            Json(lib_body(
+                "recorder",
+                LibraryKind::Liverec,
+                media.to_str().unwrap(),
+            )),
+        )
+        .await
+        .unwrap();
+        let lib_id = resp.0["library"]["id"].as_str().unwrap();
+        let lib = s.db.library_get(lib_id).unwrap().unwrap();
+        let unavailable_probe = tmp.path().join("missing-ffprobe");
+        scan_folder_library(&s.db, &lib, &unavailable_probe)
+            .await
+            .unwrap();
+        let mut record =
+            s.db.asset_list_for_library(lib_id, 10, 0)
+                .unwrap()
+                .remove(0);
+        assert_eq!(
+            record.asset.started_at.as_deref(),
+            Some("2026-10-05T08:54:03+08:00")
+        );
+        assert_eq!(record.asset.pub_privacy, "private");
+        assert_eq!(record.asset.pub_category_id, "22");
+        record.asset.pub_title = Some("用户发布标题".into());
+        record.asset.pub_description = Some("用户描述".into());
+        record.asset.pub_privacy = "unlisted".into();
+        record.asset.custom_tags = vec!["用户分组".into()];
+        record.asset.display_title = Some("用户显示名".into());
+        record.asset.upload_targets = vec![json!({"platform":"youtube","videoId":"existing"})];
+        let metadata = media::parse_probe(&json!({
+            "format":{"duration":"120"},
+            "streams":[{"codec_type":"video","codec_name":"h264","width":720,"height":1280}]
+        }))
+        .unwrap();
+        record.asset.custom_meta = Some(json!({
+            "userSetting": "preserved",
+            "scanner":{"version":1,"role":"legacy","metadata":metadata}
+        }));
+        s.db.asset_put(&record).unwrap();
+        // The media file stays unchanged while its XML arrives later.
+        let xml = room.join("2026-10-05 08-54-03-075 直播标题.xml");
+        fs::write(xml, "<i><metadata><video_start_time>1791204846479</video_start_time><room_title>正确的直播标题</room_title><user_name>主播甲</user_name><room_id>22551964</room_id></metadata></i>").unwrap();
+        scan_folder_library(&s.db, &lib, &unavailable_probe)
+            .await
+            .unwrap();
+        let updated = s.db.asset_get(&record.id).unwrap().unwrap();
+        assert_eq!(updated.asset.title, "正确的直播标题");
+        assert_eq!(updated.asset.room_id.as_deref(), Some("22551964"));
+        assert_eq!(
+            updated.asset.time_source.as_deref(),
+            Some("xml:video_start_time")
+        );
+        assert_eq!(updated.asset.sidecars.len(), 1);
+        assert_eq!(updated.asset.duration_sec, Some(120.0));
+        assert_eq!(updated.asset.width, Some(720));
+        assert_eq!(
+            updated.asset.custom_meta.as_ref().unwrap()["scanner"]["metadata"]["signature"],
+            metadata.signature
+        );
+        assert_eq!(
+            updated.asset.custom_meta.as_ref().unwrap()["userSetting"],
+            "preserved"
+        );
+        assert!(!updated
+            .asset
+            .warnings
+            .iter()
+            .any(|w| w.contains("探测失败")));
+        assert_eq!(updated.asset.pub_title.as_deref(), Some("用户发布标题"));
+        assert_eq!(updated.pub_title.as_deref(), Some("用户发布标题"));
+        assert_eq!(updated.asset.pub_description.as_deref(), Some("用户描述"));
+        assert_eq!(updated.asset.pub_privacy, "unlisted");
+        assert_eq!(updated.asset.custom_tags, vec!["用户分组"]);
+        assert_eq!(updated.asset.display_title.as_deref(), Some("用户显示名"));
+        assert_eq!(updated.asset.upload_targets.len(), 1);
     }
 
     #[tokio::test]
@@ -958,10 +1104,10 @@ mod tests {
         .unwrap();
         let lib_id = resp.0["library"]["id"].as_str().unwrap().to_string();
 
-        trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
+        let _ = trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
             .await
             .unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_scan(&s, &lib_id).await;
 
         // Page 0, 3 per page.
         let q = AssetQuery {
@@ -1009,10 +1155,10 @@ mod tests {
         .unwrap();
         let lib_id = resp.0["library"]["id"].as_str().unwrap().to_string();
 
-        trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
+        let _ = trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
             .await
             .unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_scan(&s, &lib_id).await;
 
         let assets = list_assets(
             State(s.clone()),
@@ -1075,10 +1221,10 @@ mod tests {
         .await
         .unwrap();
         let lib_id = resp.0["library"]["id"].as_str().unwrap().to_string();
-        trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
+        let _ = trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
             .await
             .unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_scan(&s, &lib_id).await;
 
         let assets = list_assets(
             State(s.clone()),
@@ -1130,10 +1276,10 @@ mod tests {
         .await
         .unwrap();
         let lib_id = resp.0["library"]["id"].as_str().unwrap().to_string();
-        trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
+        let _ = trigger_scan(State(s.clone()), axum::extract::Path(lib_id.clone()))
             .await
             .unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_scan(&s, &lib_id).await;
 
         let assets = list_assets(
             State(s.clone()),
