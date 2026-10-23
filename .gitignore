@@ -1,4 +1,5 @@
 /LiveRec/
+/LiveRec-video-deletion-manifest.csv
 /.build-tools/
 /.playwright-cli/
 /biliLive-tools/

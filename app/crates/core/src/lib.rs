@@ -1,4 +1,5 @@
 mod catalog;
+mod cleanup;
 mod db;
 mod jobs;
 pub mod library;
@@ -147,6 +148,7 @@ pub async fn start(mut config: Config) -> Result<Running> {
     let library = db.get::<Library>("library", "main")?.unwrap_or_default();
     youtube::recover(&db)?;
     workflow::recover(&db)?;
+    cleanup::recover(&db)?;
     // Legacy single-library guard: only enforce when a library root was
     // recorded in the old schema AND differs from the current --library path.
     // New installations (multi-library model) will have an empty root and skip this.

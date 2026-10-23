@@ -141,6 +141,7 @@ Aligned with [`docs/DEVELOPMENT-ROADMAP.md`](docs/DEVELOPMENT-ROADMAP.md) and [`
 | Horizon | Direction |
 | --- | --- |
 | **Near** | Finish v0.8 multi-library Phase 1 (publish-metadata editor, cross-library list, legacy LiveRec migration); stronger identity ledger UX; L1 module sharing; safer remote batch apply on real channels; upload→playlist/thumbnail chaining |
+| **v0.8.1 planned** | [Local video cleanup module](docs/WORKFLOW-LOCAL-VIDEO-CLEANUP.md): delete confirmed uploaded videos from a reviewed, frozen list; support explicit exclusions and preserve all sidecars, metadata and online associations. Windows manual confirmation and exact-file YouTube verification available in v0.8.1-preview.2; full acceptance pending. |
 | **Next** | biliLive-tools adapter for live recording; multi-root libraries; captions/chapters; session/version archive model |
 | **Later** | Trusted L2 preview sandbox; optional AI providers; cross-platform signed installs; NAS/Docker headless with proper OAuth |
 
@@ -154,6 +155,7 @@ Priorities may change; unchecked items are **not** release promises.
 | --- | --- |
 | [`docs/WORKFLOW-MODULE-API.md`](docs/WORKFLOW-MODULE-API.md) | Module capabilities, YouTube API mapping, third-party L1 guide |
 | [`docs/WORKFLOW-INTENT-SCHEMA.md`](docs/WORKFLOW-INTENT-SCHEMA.md) | Host Intent kinds |
+| [`docs/WORKFLOW-LOCAL-VIDEO-CLEANUP.md`](docs/WORKFLOW-LOCAL-VIDEO-CLEANUP.md) | v0.8.1 local video cleanup module design and acceptance criteria and preview implementation status |
 | [`docs/CHANNEL-WORKFLOW-DESIGN.md`](docs/CHANNEL-WORKFLOW-DESIGN.md) | Channel batch design + implementation status |
 | [`docs/BUILD-STATUS.md`](docs/BUILD-STATUS.md) | Per-version verification log |
 | [`app/release/media/`](app/release/media/) | Reviewed FFmpeg pins for stable release CI |

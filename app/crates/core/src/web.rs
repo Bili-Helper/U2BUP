@@ -42,6 +42,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/session", post(session))
         .merge(crate::youtube::router())
         .merge(crate::workflow::router())
+        .merge(crate::cleanup::router())
         .merge(crate::library::router())
         .route("/api/snapshot", get(snapshot))
         .route("/api/status", get(status))
@@ -168,7 +169,7 @@ async fn snapshot(
     State(s): State<Arc<AppState>>,
     Query(q): Query<SnapshotQuery>,
 ) -> Result<Json<Value>> {
-    let (library, scan) = if let Some(id) = q.library_id {
+    let (mut library, scan) = if let Some(id) = q.library_id {
         let root: LibraryRoot = s.db.library_get(&id)?.context("素材库不存在")?;
         let library = if root.last_scanned_at.is_none()
             && s.db.asset_count_for_library(&id)? == 0
@@ -200,6 +201,7 @@ async fn snapshot(
             s.scan_status.lock().await.clone(),
         )
     };
+    crate::cleanup::restore_metadata(&s.db, &mut library)?;
     let library_path = library.root.clone();
     Ok(Json(
         json!({"library":library,"scan":scan,"jobs":s.db.list::<Job>("job")?,"plans":s.db.list::<Plan>("plan")?,"settings":{"library":if library_path.is_empty() { s.config.library.to_string_lossy().into_owned() } else { library_path },"output":s.config.output,"data":s.config.data,"ffmpeg":s.config.ffmpeg,"ffprobe":s.config.ffprobe,"version":env!("CARGO_PKG_VERSION"),"mode":if s.config.headless {"Headless · 单用户"} else {"本机 · 单用户"}}}),
@@ -273,6 +275,7 @@ async fn task_list(s: &AppState) -> anyhow::Result<Vec<Value>> {
             }
         }));
     }
+    tasks.extend(crate::cleanup::task_summaries(&s.db)?);
     tasks.sort_by(|a, b| {
         b["created_at"]
             .as_str()
