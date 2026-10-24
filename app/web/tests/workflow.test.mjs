@@ -6,6 +6,13 @@ function graph(...types){const nodes=types.map((type,index)=>createNode(type,ind
 function video(id,title,description='',extra={}){return normalizeYoutube({id,snippet:{title,description,tags:[],categoryId:'20',publishedAt:'2026-09-22T00:00:00Z'},status:{privacyStatus:'private'},contentDetails:{duration:'PT1H'},...extra});}
 function run(g,records,context={}){const result=runWorkflow(g,records,context);assert.equal(result.valid,true,result.errors.join('; '));return result.records;}
 
+test('cleanup preview requires a separate reviewed plan and emits no delete intent',()=>{
+  const [result]=run(graph('input','cleanup-local-video','output'),[video('one','uploaded')]);
+  assert.ok(result.issues.some(i=>i.code==='cleanup_review'));
+  assert.equal(result.intents.length,0);
+  assert.equal(result.changes.length,0);
+});
+
 test('normalization does not mistake publishedAt, categoryId or licensedContent for recording/content/copyright facts',()=>{
   const source=video('one','无结构标题','',{contentDetails:{duration:'PT1H2M3S',licensedContent:true}});
   assert.equal(source.recordedAt,'');assert.equal(source.durationSeconds,3723);assert.equal(source.copyrightStatus,'unknown');

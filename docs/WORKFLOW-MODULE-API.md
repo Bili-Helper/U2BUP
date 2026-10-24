@@ -373,6 +373,14 @@ UI 入口：**处理管线 → 自定义管线 → 模块管理**。
 
 仅维护者可做：在 `KNOWN_INTENT_KINDS`、`workflow_write` 白名单、apply 分支中登记，并更新本文与 Intent Schema。候选方向（未实现）：字幕、章节、`publish.settings` 实写、Analytics 只读。
 
+### 8.5 v0.8.1：上传后清理本地视频（首个预览实现）
+
+已注册内置模块 `com.u2bup.builtin.cleanup-local-video`（短名 `cleanup-local-video`），归入「发布与归档」。图预览生成 `cleanup_review` 提示，用户进入工作流清理面板选择视频、填写人工上传确认并设置保留项，生成独立冻结计划。Windows 宿主按文件句柄执行删除。接口为 `GET/POST /api/workflows/cleanup` 与 `POST /api/workflows/cleanup/{id}/apply`，均沿用应用会话认证。
+
+拟新增 `local.video.delete` Intent，只允许内置模块提出，由 Rust 宿主检查文件身份、路径边界、排除项、活动任务及上传证据后执行。预览仍为纯函数；L1 安装包不获得文件删除能力。该 Intent **尚未加入当前白名单**，现有 `sideEffect: "pure"` 与安装协议不变。
+
+完整目标与当前实现差异见 [WORKFLOW-LOCAL-VIDEO-CLEANUP.md](WORKFLOW-LOCAL-VIDEO-CLEANUP.md)。当前专用清理接口不通过通用图 apply；同文件 YouTube 平台核验已在 preview.2 接入专用清理接口；通用删除 Intent 尚未开放。
+
 ---
 
 ## 9. 源码索引

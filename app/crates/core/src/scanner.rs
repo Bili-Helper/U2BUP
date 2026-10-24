@@ -479,6 +479,7 @@ pub(crate) async fn scan(state: Arc<AppState>) -> Result<()> {
     }
     library.rooms = rooms.into_values().collect();
     library.scanned_at = Some(now());
+    crate::cleanup::restore_metadata(&state.db, &mut library)?;
     state.db.put("library", "main", &library)?;
     *state.library.write().await = library;
     Ok(())

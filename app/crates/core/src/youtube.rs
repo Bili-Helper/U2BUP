@@ -648,6 +648,8 @@ struct UploadJob {
     path: String,
     bytes: u64,
     modified_ms: u64,
+    #[serde(default)]
+    file_stamp: Option<String>,
     metadata: Metadata,
     channel_id: String,
     status: String,
@@ -775,6 +777,7 @@ async fn enqueue(State(s): State<Arc<AppState>>, Json(r): Json<Enqueue>) -> Http
             path: path.to_string_lossy().into(),
             bytes: a.bytes,
             modified_ms: media::modified_ms(&stat),
+            file_stamp: None,
             metadata,
             channel_id: channel.clone(),
             status: "queued".into(),
@@ -1131,6 +1134,16 @@ fn remote_offset(r: &reqwest::Response, total: u64) -> Result<u64> {
 async fn upload(s: &AppState, j: &mut UploadJob) -> Result<()> {
     if credentials(s)?.channel_id != j.channel_id {
         bail!("当前频道与任务频道不同，请连接原频道");
+    }
+    // A guard freezes file identity/content for the entire upload attempt. Old
+    // resumable sessions without this evidence remain manual-cleanup-only.
+    let guard = crate::cleanup::guard_upload(std::path::Path::new(&j.path)).ok();
+    if let Some(stamp) = &j.file_stamp {
+        if guard.as_ref().map(|g| &g.stamp) != Some(stamp) {
+            bail!("上传文件身份已变化或无法锁定，请重新核对原任务");
+        }
+    } else if j.session.is_none() {
+        j.file_stamp = guard.as_ref().map(|g| g.stamp.clone());
     }
     let mut file = tokio::fs::File::open(&j.path).await?;
     let stat = file.metadata().await?;
@@ -1654,6 +1667,7 @@ pub(crate) mod protocol_tests {
             path: path.to_string_lossy().into(),
             bytes: bytes.len() as u64,
             modified_ms: media::modified_ms(&stat),
+            file_stamp: None,
             metadata: Metadata {
                 title: "测试".into(),
                 description: String::new(),

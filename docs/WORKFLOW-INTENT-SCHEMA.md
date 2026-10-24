@@ -19,6 +19,12 @@ Plugins and builtin preview modules may only **emit** these intents. The host ap
 | `agent.task` | ai | Preview only until a provider is wired |
 | `publish.settings` | future publish module | Review placeholder |
 
+## Planned for v0.8.1 (not accepted by the current host)
+
+`local.video.delete` is proposed for the builtin `cleanup-local-video` module. It references a host-frozen plan item and upload-confirmation evidence; the host resolves the file identity and path and checks exclusions, library boundaries and active dependencies before deletion. Preview remains pure. Third-party L1 modules cannot request file deletion.
+
+This kind is **not currently registered** in `KNOWN_INTENT_KINDS` or implemented by apply. See [local video cleanup design and acceptance criteria](WORKFLOW-LOCAL-VIDEO-CLEANUP.md).
+
 ## Shape (TypeScript)
 
 See `app/web/src/modules/types.ts` `HostIntent`. Playlist intents remain mirrored as `PlaylistIntent` for the existing freeze payload.

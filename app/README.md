@@ -1,4 +1,4 @@
-# U2BUP 0.8.0-preview.4
+# U2BUP 0.8.1-preview.2
 
 Rust + Tauri + Vue 的本机录播工作台原型。第一阶段面向现有 LiveRec 历史素材，原始录像保留，成品写入独立目录。
 

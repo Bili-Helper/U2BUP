@@ -60,6 +60,7 @@ export interface WorkflowResult { valid:boolean; errors:string[]; records:Record
 const option = (value:string,label:string) => ({value,label});
 
 const BUILTIN_SPECS: Array<NodeDefinition & { id:string; capabilities:string[] }> = [
+  {id:'com.u2bup.builtin.cleanup-local-video',type:'cleanup-local-video',label:'上传后清理本地视频',description:'确认在线副本后清理视频，保留全部旁文件；通过清理面板冻结并执行。',group:'发布与归档',color:'#c77842',defaults:{},capabilities:['read.record'],fields:[]},
   {id:'com.u2bup.builtin.input',type:'input',label:'素材输入',description:'将所选频道视频和本地素材转为统一记录；按真实 ID 去重。',group:'流转',color:'#7b8cff',defaults:{kind:'all'},capabilities:['read.record'],fields:[{key:'kind',label:'接收素材',type:'select',options:[option('all','全部所选素材'),option('youtube','仅已上传视频'),option('local','仅本地素材')]}]},
   {id:'com.u2bup.builtin.parse',type:'parse',label:'历史标题解析',description:'提取主播、平台、房间、录像日期、场次和明确分片，保留证据及不确定项。',group:'理解',color:'#8f86ff',defaults:{removeTechnical:false},capabilities:['read.record','write.fields:creator,roomId,platform,recordedAt,sessionTitle'],fields:[{key:'removeTechnical',label:'从主题移出明确技术后缀',type:'checkbox',help:'仅处理 flv / merged / 合并 / 8 位哈希；rN_M 含义未验证，始终保留。'}]},
   {id:'com.u2bup.builtin.identity',type:'identity',label:'来源身份台账',description:'按房间号匹配已确认身份与别名；冲突进入复核，不因裸数字断定平台。',group:'理解',color:'#7aa2ff',defaults:{requireConfirmed:true},capabilities:['read.record','write.fields:creator,platform,roomId','emit.intent:identity.upsert'],fields:[{key:'requireConfirmed',label:'仅应用台账中的已确认身份',type:'checkbox',help:'关闭后仍要求房间号一致，但允许把台账创建者写入候选。'}]},
@@ -520,6 +521,9 @@ export function runWorkflow(graph:WorkflowGraph,records:NormalizedRecord[],conte
           addIssue(state.record,'agent_pending','Agent 尚未接入；仅生成结构化任务，没有生成标题或视频理解结论','review',id);message='结构化 Agent 输入已就绪，等待接入与人工审阅';break;
         }
         case 'join':message='已合并实际到达分支；未发现字段冲突';break;
+        case 'cleanup-local-video':
+          addIssue(state.record,'cleanup_review','请进入「上传后清理本地视频」面板，确认在线副本、设置保留项并生成独立清理计划','review',id);
+          message='清理候选需要专用清理计划；本次预览不删除文件';break;
         case 'output':message='本地预览完成，尚未执行远端修改';break;
         default: {
           const produced=runModuleHandler(node.type,state.record as any,config,context as any,id);
@@ -550,7 +554,7 @@ function ensureBuiltinsRegistered() {
   for(const spec of BUILTIN_SPECS) {
     registerBuiltin({
       id:spec.id,
-      version:'0.8.0-preview.4',
+      version:'0.8.1-preview.2',
       apiVersion:1,
       kind:'builtin',
       alias:spec.type,
